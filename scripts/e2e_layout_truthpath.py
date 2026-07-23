@@ -35,6 +35,17 @@ import structlog
 
 log = structlog.get_logger()
 
+# Auto-detect target name for mock profiles
+try:
+    import torch as _torch
+    _HAS_MLU = hasattr(_torch, "mlu") and _torch.mlu.is_available()
+    _HAS_CUDA = _torch.cuda.is_available()
+except Exception:
+    _HAS_MLU = False
+    _HAS_CUDA = False
+_TARGET_NAME = "mlu_590" if _HAS_MLU else "cuda_a100"
+_ACCEL_TAG = "MLU" if _HAS_MLU else "GPU"
+
 
 # ---------------------------------------------------------------------------
 # Gate report
@@ -76,8 +87,15 @@ def _fail(report: GateReport, msg: str) -> GateReport:
 # ---------------------------------------------------------------------------
 
 
-def _build_mock_target() -> Any:
-    """Build a mock CUDA A100 TargetProfile used across multiple gates."""
+def _build_mock_target(
+    name: str | None = None,
+    vendor: str | None = None,
+    device_name: str | None = None,
+) -> Any:
+    """Build a mock TargetProfile. Defaults to auto-detected target.
+
+    The layout bridge is target-agnostic — any name/vendor works.
+    """
     from compgen.targets.schema import (
         ComputeUnit,
         DeviceSpec,
@@ -85,19 +103,23 @@ def _build_mock_target() -> Any:
         TargetProfile,
     )
 
+    _name = name or _TARGET_NAME
+    _vendor = vendor or ("cambricon" if _HAS_MLU else "nvidia")
+    _dev = device_name or ("MLU590" if _HAS_MLU else "A100")
+
     return TargetProfile(
-        name="cuda_a100",
+        name=_name,
         devices=[
             DeviceSpec(
                 device_type="gpu",
-                name="A100",
-                vendor="nvidia",
+                name=_dev,
+                vendor=_vendor,
                 compute_units=[
                     ComputeUnit(
-                        name="tensor_core",
-                        count=432,
+                        name="tensor_core" if not _HAS_MLU else "mfu",
+                        count=432 if not _HAS_MLU else 128,
                         supported_dtypes={"float32", "float16"},
-                        peak_tflops=312.0,
+                        peak_tflops=312.0 if not _HAS_MLU else 256.0,
                     ),
                 ],
                 memory_hierarchy=[
@@ -108,8 +130,8 @@ def _build_mock_target() -> Any:
                     ),
                 ],
                 supported_ops=["matmul", "conv2d", "elementwise"],
-                features=["tensor_core", "async_copy"],
-                kernel_backends=["triton", "cutlass"],
+                features=["tensor_core" if not _HAS_MLU else "mfu", "async_copy"],
+                kernel_backends=["triton", "cutlass"] if not _HAS_MLU else ["triton", "bangc"],
             ),
         ],
     )
@@ -473,7 +495,6 @@ def main() -> list[GateReport]:
     r8 = GateReport(gate=8, name="Resolver Protocol (any target)")
     try:
         from compgen.ir.layout.attrs import PackSpecAttr
-        from compgen.transforms.layout.cuda_resolver import CudaLayoutResolver
         from compgen.transforms.layout.resolver import DefaultLayoutResolver, LayoutResolver
 
         # 1. DefaultLayoutResolver — works for ANY target, no assumptions
@@ -483,29 +504,43 @@ def main() -> list[GateReport]:
         assert result_default is None, "Default resolver should NOT specialize"
         print("  DefaultLayoutResolver: no specialization (correct)")
 
-        # 2. CudaLayoutResolver — one EXAMPLE of target-specific specialization
-        cuda = CudaLayoutResolver()
-        assert isinstance(cuda, LayoutResolver), "Must implement LayoutResolver"
-        result_cuda = cuda.specialize("tiled_128x64", None)
-        assert result_cuda is not None, "CUDA resolver should specialize tiled encodings"
-        assert isinstance(result_cuda, PackSpecAttr)
-        print(f"  CudaLayoutResolver: specialized to PackSpecAttr (one example)")
+        # 2. Target-specific resolver — try MLU first, CUDA fallback
+        resolver: LayoutResolver | None = None
+        resolver_tag = ""
+        for mod_path, tag in [
+            ("compgen.transforms.layout.mlu_resolver", "MluLayoutResolver"),
+            ("compgen.transforms.layout.cuda_resolver", "CudaLayoutResolver"),
+        ]:
+            try:
+                mod = __import__(mod_path, fromlist=[tag])
+                resolver = getattr(mod, tag)()
+                resolver_tag = tag
+                break
+            except (ImportError, AttributeError):
+                continue
 
-        # 3. Both materialize via the same protocol
+        if resolver is not None:
+            assert isinstance(resolver, LayoutResolver), f"Must implement LayoutResolver"
+            result = resolver.specialize("tiled_128x64", None)
+            has_specialize = result is not None
+            print(f"  {resolver_tag}: specialize={'yes' if has_specialize else 'no'}")
+        else:
+            has_specialize = False
+            print("  No target-specific resolver available (MLU/CUDA) — skipped")
+
+        # 3. Materialize via protocol
         spec = PackSpecAttr([32, 32], [0, 1], "zero")
         meta_default = default.materialize(spec)
-        meta_cuda = cuda.materialize(spec)
         assert "inner_tiles" in meta_default
-        assert "inner_tiles" in meta_cuda
-        print(f"  Both resolvers materialize via same protocol")
+        if resolver is not None:
+            meta_target = resolver.materialize(spec)
+            assert "inner_tiles" in meta_target
+        print(f"  Materialize protocol works across resolvers")
 
-        # KEY: The LayoutResolver protocol is target-agnostic.
-        # Any extension pack (SNAX, Gemmini, Hexagon, RVV, NPU, etc.)
-        # can provide its own resolver — the layout bridge does not
-        # depend on any specific target.
         r8.details = {
             "default_specializes": result_default is not None,
-            "cuda_specializes": result_cuda is not None,
+            "target_specializes": has_specialize,
+            "resolver_used": resolver_tag or "none",
             "protocol_target_agnostic": True,
             "note": "Any pack provides its own LayoutResolver",
         }

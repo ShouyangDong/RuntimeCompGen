@@ -34,6 +34,28 @@ import torch.nn as nn
 
 log = structlog.get_logger()
 
+# Auto-detect accelerator: MLU > CUDA > CPU
+_HAS_MLU = hasattr(torch, "mlu") and torch.mlu.is_available()
+_HAS_CUDA = torch.cuda.is_available()
+_HAS_ACCEL = _HAS_MLU or _HAS_CUDA
+_ACCEL_DEVICE = "mlu" if _HAS_MLU else "cuda"
+_ACCEL_TAG = "MLU" if _HAS_MLU else ("GPU" if _HAS_CUDA else "CPU")
+_TARGET_PROFILE = "examples/target_profiles/mlu_590.yaml" if _HAS_MLU else "examples/target_profiles/cuda_a100.yaml"
+_TARGET_KEY = "mlu-590" if _HAS_MLU else "cuda-a100"
+
+
+def _accel_sync() -> None:
+    if _HAS_MLU:
+        torch.mlu.synchronize()
+    elif _HAS_CUDA:
+        torch.cuda.synchronize()
+
+
+def _accel_event(enable_timing: bool = True) -> Any:
+    if _HAS_MLU:
+        return torch.mlu.Event(enable_timing=enable_timing)
+    return torch.cuda.Event(enable_timing=enable_timing)
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -111,20 +133,21 @@ def _set_verification_status(rec_verification: Any, vr: Any) -> None:
     rec_verification.overall_status = "pass" if vr.passed else "fail"
 
 
-def _benchmark_baseline_op(op_family: str, shapes: tuple, device: str = "cuda") -> float:
-    """Benchmark a baseline PyTorch op on GPU and return latency in microseconds."""
-    if not torch.cuda.is_available() or device != "cuda":
+def _benchmark_baseline_op(op_family: str, shapes: tuple, device: str | None = None) -> float:
+    """Benchmark a baseline PyTorch op on accelerator and return latency in microseconds."""
+    dev = device or _ACCEL_DEVICE
+    if not _HAS_ACCEL:
         return 0.0
     try:
         if op_family == "matmul" and len(shapes) >= 2:
-            a = torch.randn(*shapes[0], device=device, dtype=torch.float32)
-            b = torch.randn(*shapes[1], device=device, dtype=torch.float32)
+            a = torch.randn(*shapes[0], device=dev, dtype=torch.float32)
+            b = torch.randn(*shapes[1], device=dev, dtype=torch.float32)
             fn = lambda: torch.matmul(a, b)
         elif op_family == "softmax" and shapes:
-            x = torch.randn(*shapes[0], device=device, dtype=torch.float32)
+            x = torch.randn(*shapes[0], device=dev, dtype=torch.float32)
             fn = lambda: torch.softmax(x, dim=-1)
         elif op_family == "layer_norm" and shapes:
-            x = torch.randn(*shapes[0], device=device, dtype=torch.float32)
+            x = torch.randn(*shapes[0], device=dev, dtype=torch.float32)
             n = shapes[0][-1]
             fn = lambda: torch.nn.functional.layer_norm(x, (n,))
         else:
@@ -133,17 +156,17 @@ def _benchmark_baseline_op(op_family: str, shapes: tuple, device: str = "cuda") 
         # Warmup
         for _ in range(5):
             fn()
-        torch.cuda.synchronize()
+        _accel_sync()
 
         # Measure
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
+        start = _accel_event(enable_timing=True)
+        end = _accel_event(enable_timing=True)
         n_iters = 20
         start.record()
         for _ in range(n_iters):
             fn()
         end.record()
-        torch.cuda.synchronize()
+        _accel_sync()
         return start.elapsed_time(end) * 1000.0 / n_iters
     except Exception:
         return 0.0
@@ -160,10 +183,10 @@ def run_safe(label: str, fn: Any, errors: dict[str, list[str]]) -> Any:
         return None
 
 
-def make_record(model_name: str, target_name: str = "cuda-a100", **kwargs: Any) -> Any:
+def make_record(model_name: str, target_name: str | None = None, **kwargs: Any) -> Any:
     """Create a fresh RunRecord."""
     from benchmarks.record import RunRecord
-    return RunRecord(model_name=model_name, target_name=target_name, **kwargs)
+    return RunRecord(model_name=model_name, target_name=target_name or _TARGET_KEY, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +279,6 @@ def run_exp2(models: list[str], num_iter: int, out: Path, errors: dict[str, list
     from compgen.semantic.verify.harness import verify_callable_against_reference
 
     executor = LocalExecutor()
-    has_gpu = torch.cuda.is_available()
     records = []
 
     for name in models:
@@ -286,21 +308,21 @@ def run_exp2(models: list[str], num_iter: int, out: Path, errors: dict[str, list
             rec.performance.latency_median_us = cpu.latency_median_us
             rec.performance.throughput_samples_per_sec = cpu.throughput_samples_per_sec
 
-            if has_gpu:
-                # Use fresh copies for GPU (benchmark moves model in-place)
-                gpu_model = copy.deepcopy(model)
-                gpu = executor.benchmark(gpu_model, inputs, device="cuda", num_iterations=num_iter)
-                rec.baselines.eager_gpu_latency_us = gpu.latency_median_us
-                rec.performance.peak_memory_bytes = gpu.peak_memory_bytes
-                del gpu_model
+            if _HAS_ACCEL:
+                # Use fresh copies for accelerator (benchmark moves model in-place)
+                accel_model = copy.deepcopy(model)
+                accel = executor.benchmark(accel_model, inputs, device=_ACCEL_DEVICE, num_iterations=num_iter)
+                rec.baselines.eager_gpu_latency_us = accel.latency_median_us
+                rec.performance.peak_memory_bytes = accel.peak_memory_bytes
+                del accel_model
 
                 compiled_model = copy.deepcopy(model)
-                compiled = executor.benchmark(compiled_model, inputs, device="cuda", mode="compiled", num_iterations=num_iter)
+                compiled = executor.benchmark(compiled_model, inputs, device=_ACCEL_DEVICE, mode="compiled", num_iterations=num_iter)
                 rec.baselines.compiled_gpu_latency_us = compiled.latency_median_us
                 del compiled_model
 
-                if gpu.latency_median_us > 0:
-                    rec.baselines.speedup_vs_eager_gpu = gpu.latency_median_us / compiled.latency_median_us
+                if accel.latency_median_us > 0:
+                    rec.baselines.speedup_vs_eager_gpu = accel.latency_median_us / compiled.latency_median_us
 
             rec.status = "pass"
             return rec
@@ -312,7 +334,7 @@ def run_exp2(models: list[str], num_iter: int, out: Path, errors: dict[str, list
         records.append(rec)
 
         # Memory cleanup
-        if torch.cuda.is_available():
+        if _HAS_CUDA:
             torch.cuda.empty_cache()
 
     return records
@@ -798,18 +820,19 @@ def run_exp8(models: list[str], target_path: str, out: Path, errors: dict[str, l
                 from compgen.runtime.local_executor import LocalExecutor
                 import copy as _copy
                 _executor = LocalExecutor()
-                if torch.cuda.is_available():
-                    _gpu_model = _copy.deepcopy(model)
-                    eager_res = _executor.benchmark(_gpu_model, inputs, device="cuda", num_iterations=50, warmup=10)
+                if _HAS_ACCEL:
+                    _accel_model = _copy.deepcopy(model)
+                    eager_res = _executor.benchmark(_accel_model, inputs, device=_ACCEL_DEVICE, num_iterations=50, warmup=10)
                     rec.baselines.eager_gpu_latency_us = eager_res.latency_median_us
-                    del _gpu_model
+                    del _accel_model
                     _compiled_model = _copy.deepcopy(model)
-                    compiled_res = _executor.benchmark(_compiled_model, inputs, device="cuda", mode="compiled", num_iterations=50, warmup=10)
+                    compiled_res = _executor.benchmark(_compiled_model, inputs, device=_ACCEL_DEVICE, mode="compiled", num_iterations=50, warmup=10)
                     rec.baselines.compiled_gpu_latency_us = compiled_res.latency_median_us
                     del _compiled_model
                     if compiled_res.latency_median_us > 0:
                         rec.baselines.speedup_vs_compiled = eager_res.latency_median_us / compiled_res.latency_median_us
-                    torch.cuda.empty_cache()
+                    if _HAS_CUDA:
+                        torch.cuda.empty_cache()
             except Exception:
                 pass
 
@@ -977,7 +1000,7 @@ def main() -> None:
     experiments = set(int(x) for x in args.experiments.split(","))
     models = [m.strip() for m in args.models.split(",") if m.strip()] or DEFAULT_MODELS
     out = Path(args.output_dir)
-    target_path = "examples/target_profiles/cuda_a100.yaml"
+    target_path = _TARGET_PROFILE
     multi_path = "examples/target_profiles/multi_device.yaml"
 
     # Create output dirs
@@ -990,7 +1013,12 @@ def main() -> None:
     print("=" * 70)
     print(f"CompGen Paper Metrics — {datetime.now(UTC).isoformat()}")
     print(f"Models: {len(models)} | Experiments: {sorted(experiments)}")
-    print(f"GPU: {torch.cuda.get_device_name() if torch.cuda.is_available() else 'none'}")
+    if _HAS_MLU:
+        print(f"MLU: {torch.mlu.get_device_name()}")
+    elif _HAS_CUDA:
+        print(f"GPU: {torch.cuda.get_device_name()}")
+    else:
+        print("Accelerator: none (CPU-only)")
     print(f"Output: {out}")
     print("=" * 70)
 
@@ -1115,7 +1143,7 @@ def main() -> None:
         "timestamp": datetime.now(UTC).isoformat(),
         "models": models,
         "experiments": sorted(experiments),
-        "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else "none",
+        "accelerator": _ACCEL_TAG,
         "total_runs": total_runs,
         "passed": total_pass,
         "failed": total_fail,

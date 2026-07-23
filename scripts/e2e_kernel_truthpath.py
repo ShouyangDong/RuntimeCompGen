@@ -31,6 +31,30 @@ import torch
 
 log = structlog.get_logger()
 
+# Auto-detect accelerator: MLU > CUDA > CPU
+_HAS_MLU = hasattr(torch, "mlu") and torch.mlu.is_available()
+_HAS_CUDA = torch.cuda.is_available()
+_HAS_ACCEL = _HAS_MLU or _HAS_CUDA
+_ACCEL_DEVICE = "mlu" if _HAS_MLU else "cuda"
+_ACCEL_TAG = "MLU" if _HAS_MLU else "GPU"
+_TARGET_NAME = "mlu_590" if _HAS_MLU else "cuda_a100"
+_TARGET_PROFILE = f"examples/target_profiles/{_TARGET_NAME}.yaml"
+
+
+def _accel_synchronize() -> None:
+    """Synchronize the detected accelerator."""
+    if _HAS_MLU:
+        torch.mlu.synchronize()
+    elif _HAS_CUDA:
+        torch.cuda.synchronize()
+
+
+def _accel_event(enable_timing: bool = True) -> Any:
+    """Create a timing event for the detected accelerator."""
+    if _HAS_MLU:
+        return torch.mlu.Event(enable_timing=enable_timing)
+    return torch.cuda.Event(enable_timing=enable_timing)
+
 
 # ---------------------------------------------------------------------------
 # Gate report
@@ -112,7 +136,7 @@ def main() -> int:
             from compgen.targets.schema import load_profile
 
             module, _ = fx_to_xdsl(ep)
-            target = load_profile("examples/target_profiles/cuda_a100.yaml")
+            target = load_profile(_TARGET_PROFILE)
             specs = build_kernel_contracts(module, target)
             gates.append(Gate("kernel_contracts", len(specs) > 0, f"{len(specs)} specs"))
             print(f"  Built {len(specs)} kernel specs")
@@ -157,7 +181,7 @@ def main() -> int:
         input_shapes=((M, K), (K, N)),
         output_shapes=((M, N),),
         dtypes=("float32",),
-        target_name="cuda_a100",
+        target_name=_TARGET_NAME,
     )
     provider = TritonTemplateProvider()
     budget = SearchBudget(max_iterations=1, max_time_ms=30_000)
@@ -180,15 +204,15 @@ def main() -> int:
     validation_passed = False
     kernel_fn = None
 
-    if result.found and triton_available() and torch.cuda.is_available():
+    if result.found and triton_available() and _HAS_ACCEL:
         try:
             from compgen.kernels.providers.triton_templates import _import_kernel_from_source
 
             kernel_fn = _import_kernel_from_source(result.kernel_code)
 
-            A = torch.randn(M, K, device="cuda", dtype=torch.float32)
-            B = torch.randn(K, N, device="cuda", dtype=torch.float32)
-            bias = torch.randn(N, device="cuda", dtype=torch.float32)
+            A = torch.randn(M, K, device=_ACCEL_DEVICE, dtype=torch.float32)
+            B = torch.randn(K, N, device=_ACCEL_DEVICE, dtype=torch.float32)
+            bias = torch.randn(N, device=_ACCEL_DEVICE, dtype=torch.float32)
             ref_out = torch.nn.functional.gelu(A @ B + bias)
 
             actual = kernel_fn(A, B, bias)
@@ -206,9 +230,9 @@ def main() -> int:
     elif not triton_available():
         gates.append(Gate("validation", False, "triton not importable"))
         print("  SKIP: triton not importable -- source code generated but cannot execute")
-    elif not torch.cuda.is_available():
-        gates.append(Gate("validation", False, "CUDA not available"))
-        print("  SKIP: CUDA not available")
+    elif not _HAS_ACCEL:
+        gates.append(Gate("validation", False, f"no accelerator ({_ACCEL_TAG}) available"))
+        print(f"  SKIP: {_ACCEL_TAG} not available")
     else:
         gates.append(Gate("validation", False, "no kernel to validate"))
         print("  SKIP: no kernel code")
@@ -219,35 +243,35 @@ def main() -> int:
     print("\n[7/8] Benchmarking...")
     latency_us = 0.0
 
-    if validation_passed and kernel_fn is not None and torch.cuda.is_available():
+    if validation_passed and kernel_fn is not None and _HAS_ACCEL:
         try:
-            A = torch.randn(M, K, device="cuda", dtype=torch.float32)
-            B = torch.randn(K, N, device="cuda", dtype=torch.float32)
-            bias = torch.randn(N, device="cuda", dtype=torch.float32)
+            A = torch.randn(M, K, device=_ACCEL_DEVICE, dtype=torch.float32)
+            B = torch.randn(K, N, device=_ACCEL_DEVICE, dtype=torch.float32)
+            bias = torch.randn(N, device=_ACCEL_DEVICE, dtype=torch.float32)
 
             # Warmup
             for _ in range(5):
                 kernel_fn(A, B, bias)
-            torch.cuda.synchronize()
+            _accel_synchronize()
 
             # Timed
-            start_ev = torch.cuda.Event(enable_timing=True)
-            end_ev = torch.cuda.Event(enable_timing=True)
+            start_ev = _accel_event(enable_timing=True)
+            end_ev = _accel_event(enable_timing=True)
             n_iters = 50
             start_ev.record()
             for _ in range(n_iters):
                 kernel_fn(A, B, bias)
             end_ev.record()
-            torch.cuda.synchronize()
+            _accel_synchronize()
             latency_us = start_ev.elapsed_time(end_ev) * 1000.0 / n_iters
 
             gates.append(Gate("benchmark", True, f"{latency_us:.1f} us/iter"))
-            print(f"  Latency: {latency_us:.1f} us ({n_iters} iters)")
+            print(f"  Latency ({_ACCEL_TAG}): {latency_us:.1f} us ({n_iters} iters)")
         except Exception as exc:
             gates.append(Gate("benchmark", False, str(exc)))
             print(f"  Benchmark error: {exc}")
     else:
-        reason = "validation failed" if not validation_passed else "CUDA not available"
+        reason = "validation failed" if not validation_passed else f"{_ACCEL_TAG} not available"
         gates.append(Gate("benchmark", False, reason))
         print(f"  SKIP: {reason}")
 
@@ -265,7 +289,7 @@ def main() -> int:
                 "input_shapes": [(M, K), (K, N)],
                 "output_shapes": [(M, N)],
                 "dtypes": ["float32"],
-                "target_name": "cuda_a100",
+                "target_name": _TARGET_NAME,
             },
             target=None,
         )

@@ -1,0 +1,25 @@
+name: mlu_tile
+version: "0.1.0"
+kinds: ["DialectPack", "KernelPack"]
+owned_surfaces:
+  - tile_dialect_semantics
+  - tile_kernel_substrate
+sealed_surfaces:
+  - tile_dialect_semantics
+  - tile_kernel_substrate
+generation_apertures:
+  - payload_to_mlu_tile_lowering
+  - mlu_tile_schedule_generation
+  - mlu_tile_fusion_generation
+  - mlu_tile_layout_generation
+integration_mode: overlay_branch
+benchmark_suite: pack_integrations
+benchmark_targets: ["mlu_tile_smoke"]
+reference_runner: mlu_tile
+workspace_keys: ["mlu_tile"]
+third_party_names: ["mlu-tile"]
+expected_files: ["README.md"]
+available_profilers: ["cnperf"]
+metadata:
+  vendor: cambricon
+  arch: mlu590

@@ -67,15 +67,23 @@ def main() -> None:
     print(f"  Payload IR: {op_count} ops, {len(diagnostics)} diagnostics")
 
     # ----------------------------------------------------------------
-    # Step 3: Load target profile
+    # Step 3: Load target profile (auto-detect MLU / CUDA / CPU)
     # ----------------------------------------------------------------
     print("\n[3/10] Loading target profile...")
 
     from compgen.targets.schema import load_profile
 
-    target = load_profile("examples/target_profiles/cuda_a100.yaml")
-    print(f"  Target: {target.name} ({len(target.devices)} devices)")
+    _has_mlu = hasattr(torch, "mlu") and torch.mlu.is_available()
+    _has_cuda = torch.cuda.is_available()
 
+    if _has_mlu:
+        target = load_profile("examples/target_profiles/mlu_590.yaml")
+        print(f"  Target: {target.name} (MLU detected, {len(target.devices)} devices)")
+    elif _has_cuda:
+        target = load_profile("examples/target_profiles/cuda_a100.yaml")
+        print(f"  Target: {target.name} (CUDA detected, {len(target.devices)} devices)")
+    else:
+        raise RuntimeError("No supported GPU detected (MLU or CUDA)")
     # ----------------------------------------------------------------
     # Step 4: Build kernel contracts + strategy selection
     # ----------------------------------------------------------------
@@ -173,8 +181,19 @@ def main() -> None:
     cpu_result = executor.benchmark(model, sample_input, device="cpu", num_iterations=100)
     print(f"  CPU: {cpu_result.latency_median_us:.1f}us median")
 
+    # MLU benchmark (if available)
+    if _has_mlu:
+        mlu_result = executor.benchmark(model, sample_input, device="mlu", num_iterations=100)
+        print(f"  MLU: {mlu_result.latency_median_us:.1f}us median")
+
+        # Compiled benchmark on MLU
+        compiled_result = executor.benchmark(
+            model, sample_input, device="mlu", mode="compiled", num_iterations=100
+        )
+        print(f"  MLU (compiled): {compiled_result.latency_median_us:.1f}us median")
+
     # GPU benchmark (if available)
-    if torch.cuda.is_available():
+    if _has_cuda:
         gpu_result = executor.benchmark(model, sample_input, device="cuda", num_iterations=100)
         print(f"  GPU: {gpu_result.latency_median_us:.1f}us median")
 
@@ -189,8 +208,10 @@ def main() -> None:
     # ----------------------------------------------------------------
     print("\n[10/10] Report")
     print("=" * 70)
+
+    backend_tag = "MLU" if _has_mlu else ("GPU" if _has_cuda else "CPU")
     print(f"Model: SimpleMLP (fc1: 64→128, fc2: 128→32)")
-    print(f"Target: {target.name}")
+    print(f"Target: {target.name}  |  Backend: {backend_tag}")
     print(f"FX nodes: {len(ep.graph.nodes)}")
     print(f"Payload IR ops: {op_count}")
     print(f"Kernel specs: {len(specs)} (strategies: {strategy_counts})")
@@ -198,6 +219,10 @@ def main() -> None:
     print(f"Plan: {len(plan.placements)} placements, {plan.estimated_latency_us:.1f}us est.")
     print(f"Bundle: {output_dir}")
     print(f"Verification: {'PASS' if verify_result.passed else 'FAIL'}")
+    if _has_mlu:
+        print(f"MLU available:  YES  ({torch.mlu.device_count()} device(s))")
+    if _has_cuda:
+        print(f"CUDA available: YES  ({torch.cuda.device_count()} device(s))")
     print("=" * 70)
     print("\nCompGen E2E demo complete.")
 

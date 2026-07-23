@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""CUDA Tile pack integration truth path.
+"""Pack integration truth path (auto-detects MLU or CUDA pack).
 
 End-to-end validation that the pack system works: load manifest, validate
 environment, enforce apertures, generate within allowed surfaces, lower
-to Triton, verify, promote.
+to Triton/BangC, verify, promote.
 
 Gates:
     1. Pack Loading          -- manifest resolves, surfaces populated
     2. Pack Validation       -- probe passes, env check OK
     3. Sealed Surface        -- sealed surface blocked, aperture open
-    4. Pipeline Generation   -- CUDA GPU target stack runs on SimpleMLP
+    4. Pipeline Generation   -- GPU target stack runs on SimpleMLP
     5. Tile IR Lowering      -- tile ops lower to Triton code
     6. Verification          -- generated code compiles and has expected patterns
     7. Promotion             -- bundle promoted to recipe library
@@ -29,6 +29,25 @@ from typing import Any
 import structlog
 
 log = structlog.get_logger()
+
+# Auto-detect: MLU > CUDA
+try:
+    import torch as _torch
+    _HAS_MLU = hasattr(_torch, "mlu") and _torch.mlu.is_available()
+    _HAS_CUDA = _torch.cuda.is_available()
+except Exception:
+    _HAS_MLU = False
+    _HAS_CUDA = False
+
+_PACK_NAME = "mlu_tile" if _HAS_MLU else "cuda_tile"
+_PACK_DIR = f"userpacks/{_PACK_NAME}"
+_ACCEL_TAG = "MLU" if _HAS_MLU else "CUDA"
+_TARGET_NAME = "mlu_590" if _HAS_MLU else "cuda_a100"
+_SURFACE_PREFIX = "mlu" if _HAS_MLU else "cuda"
+_THIRD_PARTY_DIR = f"third_party/{_PACK_NAME}"
+_VENDOR = "cambricon" if _HAS_MLU else "nvidia"
+_KERNEL_BACKENDS = ["triton", "bangc"] if _HAS_MLU else ["triton", "cutlass"]
+_PROFILERS = ["cnperf"] if _HAS_MLU else ["nsight_systems"]
 
 
 # ---------------------------------------------------------------------------
@@ -84,8 +103,8 @@ def main() -> list[GateReport]:
     try:
         from compgen.packs.loader import load_pack
 
-        loaded = load_pack(repo_root / "userpacks" / "cuda_tile")
-        assert loaded.manifest.name == "cuda_tile", f"Expected name 'cuda_tile', got '{loaded.manifest.name}'"
+        loaded = load_pack(repo_root / _PACK_DIR)
+        assert loaded.manifest.name == _PACK_NAME, f"Expected name '{_PACK_NAME}', got '{loaded.manifest.name}'"
         assert "DialectPack" in loaded.manifest.kinds, f"Expected 'DialectPack' in kinds, got {loaded.manifest.kinds}"
         assert len(loaded.manifest.owned_surfaces) > 0, "owned_surfaces is empty"
         assert len(loaded.manifest.sealed_surfaces) > 0, "sealed_surfaces is empty"
@@ -118,7 +137,7 @@ def main() -> list[GateReport]:
 
         workspace = _MinimalWorkspace(repo_root=str(repo_root))
 
-        # The pack probe checks that third_party/cuda-tile/README.md exists
+        # The pack probe checks that third_party/<pack>/README.md exists
         probe = loaded.pack.probe(workspace)
         assert probe.available, f"Probe not available: missing={probe.missing_paths}, details={probe.details}"
         assert probe.source_root is not None, "source_root is None"
@@ -155,9 +174,10 @@ def main() -> list[GateReport]:
         print(f"  Sealed surface blocked: {violation.surface} ({violation.reason})")
 
         # Open aperture should be allowed
-        allowed = check_surface_allowed([loaded], requested_surface="payload_to_cuda_tile_lowering")
+        aperture_name = f"payload_to_{_SURFACE_PREFIX}_tile_lowering"
+        allowed = check_surface_allowed([loaded], requested_surface=aperture_name)
         assert allowed is None, f"Expected None for open aperture, got {allowed}"
-        print("  Open aperture allowed: payload_to_cuda_tile_lowering")
+        print(f"  Open aperture allowed: {aperture_name}")
 
         r3.details = {
             "sealed_blocked": True,
@@ -172,9 +192,9 @@ def main() -> list[GateReport]:
     reports.append(r3)
 
     # ==================================================================
-    # Gate 4: Pipeline Generation via CUDA GPU Stack
+    # Gate 4: Pipeline Generation via GPU Stack
     # ==================================================================
-    _gate(4, "Pipeline Generation via CUDA GPU Stack")
+    _gate(4, f"Pipeline Generation via {_ACCEL_TAG} GPU Stack")
     r4 = GateReport(gate=4, name="Pipeline Generation")
     pipeline_module = None
     try:
@@ -182,7 +202,6 @@ def main() -> list[GateReport]:
         from compgen.capture.torch_export import capture_model
         from compgen.ir.payload.import_fx import fx_to_xdsl
         from compgen.stages.registry import StageRegistry
-        from compgen.stages.targets.cuda_gpu import create_cuda_gpu_stack
         from compgen.targets.capability import infer_capabilities
         from compgen.targets.schema import DeviceSpec, TargetProfile
 
@@ -208,25 +227,42 @@ def main() -> list[GateReport]:
         op_count = sum(1 for _ in module.walk())
         print(f"  Payload IR: {op_count} ops, {len(diagnostics)} diagnostics")
 
-        # Create CUDA GPU target profile
-        output_dir = Path(tempfile.mkdtemp(prefix="cuda_tile_pack_"))
+        # Create target profile (MLU or CUDA)
+        output_dir = Path(tempfile.mkdtemp(prefix=f"{_PACK_NAME}_pack_"))
+        dev_name = "MLU590" if _HAS_MLU else "A100-SXM4-80GB"
         target = TargetProfile(
-            name="cuda_a100",
+            name=_TARGET_NAME,
             devices=[
                 DeviceSpec(
                     device_type="gpu",
-                    name="A100-SXM4-80GB",
-                    vendor="nvidia",
-                    kernel_backends=["triton", "cutlass"],
+                    name=dev_name,
+                    vendor=_VENDOR,
+                    kernel_backends=list(_KERNEL_BACKENDS),
                 ),
             ],
         )
         capabilities = infer_capabilities(target)
 
-        # Create and register CUDA GPU stack
+        # Create and register GPU stack (try MLU first, CUDA fallback)
         registry = StageRegistry()
-        stack = create_cuda_gpu_stack(output_dir=str(output_dir))
-        registry.register_target_stack(stack)
+        stack_created = False
+        for mod_path in [
+            "compgen.stages.targets.mlu_gpu",
+            "compgen.stages.targets.cuda_gpu",
+        ]:
+            try:
+                mod = __import__(mod_path, fromlist=["create_mlu_gpu_stack", "create_cuda_gpu_stack"])
+                create_fn = getattr(mod, "create_mlu_gpu_stack", None) or getattr(mod, "create_cuda_gpu_stack", None)
+                if create_fn:
+                    stack = create_fn(output_dir=str(output_dir))
+                    registry.register_target_stack(stack)
+                    stack_created = True
+                    break
+            except ImportError:
+                continue
+
+        if not stack_created:
+            raise RuntimeError(f"No GPU stack available for {_ACCEL_TAG}")
 
         # Run pipeline
         result = registry.run_pipeline(module, target, capabilities)
@@ -364,14 +400,14 @@ def main() -> list[GateReport]:
         from compgen.runtime.bundle import Bundle, BundleBuilder
 
         # Build a bundle from pipeline output
-        bundle_dir = Path(tempfile.mkdtemp(prefix="cuda_tile_bundle_"))
-        promoted_dir = Path(tempfile.mkdtemp(prefix="cuda_tile_recipes_"))
+        bundle_dir = Path(tempfile.mkdtemp(prefix=f"{_PACK_NAME}_bundle_"))
+        promoted_dir = Path(tempfile.mkdtemp(prefix=f"{_PACK_NAME}_recipes_"))
 
         if pipeline_module is not None:
             builder = BundleBuilder(output_dir=bundle_dir)
             manifest = builder.build(
                 module=pipeline_module,
-                target_name="cuda_a100",
+                target_name=_TARGET_NAME,
                 objective="latency",
                 kernel_files={"tile_matmul.py": triton_code},
                 verification_report={"passed": True, "levels": ["structural", "functional"]},
@@ -383,7 +419,7 @@ def main() -> list[GateReport]:
             bundle_dir.mkdir(parents=True, exist_ok=True)
             (bundle_dir / "payload.mlir").write_text("// placeholder payload")
             manifest = Bundle(
-                target_profile="cuda_a100",
+                target_profile=_TARGET_NAME,
                 model_hash="e2e_pack_test",
                 objective="latency",
                 artifacts={"payload": "payload.mlir"},
@@ -418,11 +454,11 @@ def main() -> list[GateReport]:
     r8 = GateReport(gate=8, name="Pack Context Summary")
     try:
         contribution = loaded.pack.compose()
-        assert contribution.pack_name == "cuda_tile"
+        assert contribution.pack_name == _PACK_NAME
         assert "tile_dialect_semantics" in contribution.owned_surfaces
         assert "tile_kernel_substrate" in contribution.owned_surfaces
         assert "tile_dialect_semantics" in contribution.sealed_surfaces
-        assert "payload_to_cuda_tile_lowering" in contribution.generation_apertures
+        assert aperture_name in contribution.generation_apertures
 
         print(f"  Pack name: {contribution.pack_name}")
         print(f"  Owned surfaces: {list(contribution.owned_surfaces)}")
@@ -456,7 +492,7 @@ def main() -> list[GateReport]:
 def _print_summary(reports: list[GateReport]) -> bool:
     """Print final summary and return True if all passed."""
     print(f"\n{'=' * 70}")
-    print("  CUDA Tile Pack Integration Truth Path -- Summary")
+    print(f"  {_ACCEL_TAG} Tile Pack Integration Truth Path -- Summary")
     print(f"{'=' * 70}")
 
     all_passed = True
