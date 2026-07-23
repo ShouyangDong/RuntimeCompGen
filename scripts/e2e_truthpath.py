@@ -31,6 +31,14 @@ import torch.nn as nn
 
 log = structlog.get_logger()
 
+# Auto-detect accelerator: MLU > CUDA > CPU
+_HAS_MLU = hasattr(torch, "mlu") and torch.mlu.is_available()
+_HAS_CUDA = torch.cuda.is_available()
+_ACCEL_TAG = "MLU" if _HAS_MLU else ("CUDA" if _HAS_CUDA else "CPU")
+_TARGET_PROFILE = "examples/target_profiles/mlu_590.yaml" if _HAS_MLU else "examples/target_profiles/cuda_a100.yaml"
+_TARGET_KEY = "mlu-590" if _HAS_MLU else "cuda-a100"
+_PACK_DIR = "userpacks/mlu_tile" if _HAS_MLU else "userpacks/cuda_tile"
+
 
 # -----------------------------------------------------------------------
 # Model definitions
@@ -144,7 +152,7 @@ def main() -> None:
         from compgen.runtime.planner import plan_execution
         from compgen.targets.schema import load_profile
 
-        target = load_profile("examples/target_profiles/cuda_a100.yaml")
+        target = load_profile(_TARGET_PROFILE)
         eqsat_result = run_eqsat_pass(module, config=EqSatConfig(max_iterations=5))
         plan = plan_execution(module, target)
 
@@ -216,7 +224,7 @@ def main() -> None:
     from compgen.packs.validate import validate_pack
 
     pack_loaded = False
-    pack_root = Path("userpacks/cuda_tile")
+    pack_root = Path(_PACK_DIR)
     try:
         loaded_pack = load_pack(pack_root)
         report.record(
@@ -326,7 +334,7 @@ def main() -> None:
         task = memory.create_task(
             kind=ObjectKind.BACKEND_PLAN,
             workload_key="SimpleMLP",
-            target_key="cuda-a100",
+            target_key=_TARGET_KEY,
             objective="latency",
         )
 
@@ -373,7 +381,7 @@ def main() -> None:
         # Promote child
         memory.promote_candidate(
             candidate_id=child.candidate_id,
-            promotion_key="cuda-a100/SimpleMLP/latency",
+            promotion_key=f"{_TARGET_KEY}/SimpleMLP/latency",
             reason="verification passed, 20% latency improvement",
             measured_gain=0.20,
             verified_by="e2e_truthpath",
@@ -484,7 +492,7 @@ def main() -> None:
             output_dir=bundle_dir,
             module=module,
             execution_plan=plan,
-            target_name="cuda-a100",
+            target_name=_TARGET_KEY,
             golden_inputs=sample_input,
             golden_outputs=model(*sample_input).detach(),
             verification_report=verify_report,

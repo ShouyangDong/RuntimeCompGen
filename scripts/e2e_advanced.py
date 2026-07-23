@@ -77,7 +77,19 @@ def main() -> None:
     inp = (torch.randn(8, 64),)
     ep = capture_model(model, inp)
     module, _ = fx_to_xdsl(ep)
-    target = load_profile("examples/target_profiles/cuda_a100.yaml")
+
+    # Auto-detect available accelerator: MLU > CUDA > CPU
+    _has_mlu = hasattr(torch, "mlu") and torch.mlu.is_available()
+    _has_cuda = torch.cuda.is_available()
+
+    if _has_mlu:
+        target = load_profile("examples/target_profiles/mlu_590.yaml")
+        print(f"Target: {target.name} (MLU detected)")
+    elif _has_cuda:
+        target = load_profile("examples/target_profiles/cuda_a100.yaml")
+        print(f"Target: {target.name} (CUDA detected)")
+    else:
+        raise RuntimeError("No supported GPU detected (MLU or CUDA)")
 
     # ===================================================================
     # GATE 28: Recipe IR — seed generation + validation + lowering
@@ -230,38 +242,41 @@ def main() -> None:
         report.record("multi_device_placement", False, str(exc))
 
     # ===================================================================
-    # GATE 32: GPU numeric verification (fp32 + fp16)
+    # GATE 32: Accelerator numeric verification (fp32 + fp16) — MLU or CUDA
     # ===================================================================
     print("\n" + "=" * 70)
-    print("GATE 32: GPU numeric verification")
+    print("GATE 32: Accelerator numeric verification")
     print("=" * 70)
 
     from compgen.semantic.verify.harness import verify_callable_against_reference
 
-    if torch.cuda.is_available():
-        try:
-            gpu_model = SimpleMLP().eval().cuda()
-            gpu_inp = torch.randn(8, 64, device="cuda")
+    _accel_device = "mlu" if _has_mlu else "cuda"
+    _accel_tag = "MLU" if _has_mlu else "GPU"
 
-            # fp32 verification on GPU
+    if _has_mlu or _has_cuda:
+        try:
+            accel_model = SimpleMLP().eval().to(_accel_device)
+            accel_inp = torch.randn(8, 64, device=_accel_device)
+
+            # fp32 verification on accelerator
             with torch.no_grad():
                 fp32_result = verify_callable_against_reference(
-                    name="gpu_fp32_eager_vs_compiled",
-                    ref_fn=lambda: gpu_model(gpu_inp),
-                    got_fn=lambda: torch.compile(gpu_model, backend="eager")(gpu_inp),
-                    out_dir=out / "verify_gpu_fp32",
+                    name="accel_fp32_eager_vs_compiled",
+                    ref_fn=lambda: accel_model(accel_inp),
+                    got_fn=lambda: torch.compile(accel_model, backend="eager")(accel_inp),
+                    out_dir=out / "verify_accel_fp32",
                 )
 
-            # fp16 verification on GPU (looser tolerance)
-            gpu_model_fp16 = SimpleMLP().eval().half().cuda()
-            gpu_inp_fp16 = torch.randn(8, 64, device="cuda", dtype=torch.float16)
+            # fp16 verification on accelerator (looser tolerance)
+            accel_model_fp16 = SimpleMLP().eval().half().to(_accel_device)
+            accel_inp_fp16 = torch.randn(8, 64, device=_accel_device, dtype=torch.float16)
 
             with torch.no_grad():
                 fp16_result = verify_callable_against_reference(
-                    name="gpu_fp16_eager_vs_compiled",
-                    ref_fn=lambda: gpu_model_fp16(gpu_inp_fp16),
-                    got_fn=lambda: torch.compile(gpu_model_fp16, backend="eager")(gpu_inp_fp16),
-                    out_dir=out / "verify_gpu_fp16",
+                    name="accel_fp16_eager_vs_compiled",
+                    ref_fn=lambda: accel_model_fp16(accel_inp_fp16),
+                    got_fn=lambda: torch.compile(accel_model_fp16, backend="eager")(accel_inp_fp16),
+                    out_dir=out / "verify_accel_fp16",
                     atol=1e-2,
                     rtol=1e-2,
                 )
@@ -269,13 +284,13 @@ def main() -> None:
             report.record(
                 "gpu_verification",
                 fp32_result.passed and fp16_result.passed,
-                f"fp32: max_abs={fp32_result.comparisons[0].max_abs_error:.2e}, "
+                f"[{_accel_tag}] fp32: max_abs={fp32_result.comparisons[0].max_abs_error:.2e}, "
                 f"fp16: max_abs={fp16_result.comparisons[0].max_abs_error:.2e}",
             )
         except Exception as exc:
             report.record("gpu_verification", False, str(exc))
     else:
-        report.record("gpu_verification", True, "skipped (no CUDA) — not a failure")
+        report.record("gpu_verification", True, "skipped (no MLU, no CUDA) — not a failure")
 
     # ===================================================================
     # GATE 33: Semantic verification (translation validation)
@@ -326,13 +341,14 @@ def main() -> None:
 
         result = subprocess.run(
             [
-                "uv", "run", "compgen", "analyze",
+                sys.executable, "-m", "compgen", "analyze",
                 str(model_path),
                 "--inputs", str(inputs_yaml),
-                "--target", "examples/target_profiles/cuda_a100.yaml",
+                "--target", "examples/target_profiles/mlu_590.yaml",
                 "--output-dir", str(cli_out),
             ],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, timeout=120,
+            env={**os.environ, "PYTHONPATH": "python"},
         )
 
         # Check artifacts were produced
@@ -386,25 +402,25 @@ def main() -> None:
         from compgen.packs.loader import load_pack
         from compgen.packs.verify import check_surface_allowed
 
-        cuda_tile = load_pack("userpacks/cuda_tile")
+        mlu_tile = load_pack("userpacks/mlu_tile")
 
         # Sealed surface should block
         violation = check_surface_allowed(
-            [cuda_tile],
+            [mlu_tile],
             requested_surface="tile_dialect_semantics",
         )
 
         # Non-sealed surface should allow
         no_violation = check_surface_allowed(
-            [cuda_tile],
-            requested_surface="payload_to_cuda_tile_lowering",
+            [mlu_tile],
+            requested_surface="payload_to_mlu_tile_lowering",
         )
 
         report.record(
             "pack_aperture_enforcement",
             violation is not None and no_violation is None,
             f"sealed 'tile_dialect_semantics' blocked={violation is not None}, "
-            f"open 'payload_to_cuda_tile_lowering' allowed={no_violation is None}",
+            f"open 'payload_to_mlu_tile_lowering' allowed={no_violation is None}",
         )
     except Exception as exc:
         report.record("pack_aperture_enforcement", False, str(exc))
@@ -428,10 +444,10 @@ def main() -> None:
         # Store knowledge from a "successful" optimization
         knowledge = mem.store_knowledge(
             kind=KnowledgeKind.OPTIMIZATION_TACTIC,
-            summary="Tiling matmul with [64,64,32] on A100 gives 15% speedup",
-            artifact="tile_config: [64, 64, 32]\ntarget: cuda-a100",
+            summary="Tiling matmul with [64,64,32] on 590 gives 15% speedup",
+            artifact="tile_config: [64, 64, 32]\ntarget: mlu-590",
             scope_kind=ScopeKind.TARGET,
-            scope_key="cuda-a100",
+            scope_key="mlu-590",
             source="e2e_test",
         )
 
@@ -439,7 +455,7 @@ def main() -> None:
         retrieved = mem.retrieve_knowledge(
             kind=KnowledgeKind.OPTIMIZATION_TACTIC,
             scope_kind=ScopeKind.TARGET,
-            scope_key="cuda-a100",
+            scope_key="mlu-590",
         )
 
         found = any(k.knowledge_id == knowledge.knowledge_id for k in retrieved)
@@ -447,14 +463,14 @@ def main() -> None:
         # Store a second knowledge item and verify both are retrievable
         knowledge2 = mem.store_knowledge(
             kind=KnowledgeKind.HARDWARE_RULE,
-            summary="A100 prefers TN layout for matmul",
+            summary="590 prefers TN layout for matmul",
             artifact="layout: TN\nreason: tensor core alignment",
             scope_kind=ScopeKind.TARGET,
-            scope_key="cuda-a100",
+            scope_key="mlu-590",
             source="e2e_test",
         )
 
-        all_knowledge = mem.retrieve_knowledge(scope_kind=ScopeKind.TARGET, scope_key="cuda-a100")
+        all_knowledge = mem.retrieve_knowledge(scope_kind=ScopeKind.TARGET, scope_key="mlu-590")
 
         mem.close()
 

@@ -2,21 +2,12 @@
 
 The runtime provides JIT compilation of BangC source via CNCC
 (Cambricon Neuware Compiler) and dispatch via CNRT (Cambricon
-Neuware Runtime). This is the MLU equivalent of NVIDIA's NVRTC +
-CUDA driver dispatch.
+Neuware Runtime).
 
-CNCC JIT flow::
-
-    BangC source → cncc --bangc ... → .o / .so → dlopen →
-    cnrtInvokeKernel dispatch
-
-Key CNRT primitives:
-- ``cnrtInit()`` — initialize the runtime (like ``cuInit``).
-- ``cnrtCreateQueue()`` — create a compute queue.
-- ``cnrtInvokeKernel()`` — launch a kernel (like ``cuLaunchKernel``).
-- ``cnrtSyncQueue()`` — synchronize (like ``cuStreamSynchronize``).
-
-The runtime satisfies :class:`compgen.targets.gpu.contracts.GpuRuntime`.
+CNRT function names vary across Neuware versions (``cnInit`` vs
+``cnrtInit``, ``cnCreateQueue`` vs ``cnrtCreateQueue``, etc.).
+All bindings are resolved lazily via the shared helper in
+:mod:`compgen.targets.gpu.cambricon.mlu.probe`.
 """
 
 from __future__ import annotations
@@ -28,71 +19,16 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from compgen.targets.gpu.cambricon.mlu.probe import _load_cnrt, _resolve_cnrt_lib_path
+from compgen.targets.gpu.cambricon.mlu.probe import (
+    _bind_cnrt_func,
+    _load_cnrt,
+    _resolve_cnrt_lib_path,
+)
 
 
 # ---------------------------------------------------------------------------
-# CNRT ctypes bindings (extended — kernel launch subset)
+# CNCC discovery
 # ---------------------------------------------------------------------------
-
-_CNRT_EXT_LIB: Any | None = None
-
-
-def _load_cnrt_ext() -> Any | None:
-    """Load CNRT with the full kernel-launch API bound."""
-    global _CNRT_EXT_LIB
-    if _CNRT_EXT_LIB is not None:
-        return _CNRT_EXT_LIB
-
-    lib_path = _resolve_cnrt_lib_path()
-    if lib_path is None:
-        return None
-
-    try:
-        lib = ctypes.CDLL(lib_path)
-    except OSError:
-        return None
-
-    # --- cnrtInit ---
-    lib.cnrtInit.restype = ctypes.c_int
-    lib.cnrtInit.argtypes = [ctypes.c_int]
-
-    # --- cnrtCreateQueue ---
-    lib.cnrtCreateQueue.restype = ctypes.c_int
-    lib.cnrtCreateQueue.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
-
-    # --- cnrtDestroyQueue ---
-    lib.cnrtDestroyQueue.restype = ctypes.c_int
-    lib.cnrtDestroyQueue.argtypes = [ctypes.c_void_p]
-
-    # --- cnrtSyncQueue ---
-    lib.cnrtSyncQueue.restype = ctypes.c_int
-    lib.cnrtSyncQueue.argtypes = [ctypes.c_void_p]
-
-    # --- cnrtInvokeKernel ---
-    # Note: actual signature varies by Neuware version; this
-    # is the simplified call shape.
-    lib.cnrtInvokeKernel.restype = ctypes.c_int
-    lib.cnrtInvokeKernel.argtypes = [
-        ctypes.c_void_p,  # kernel handle
-        ctypes.c_uint,    # dimX
-        ctypes.c_uint,    # dimY
-        ctypes.c_uint,    # dimZ
-        ctypes.c_void_p,  # queue
-        ctypes.c_void_p,  # params
-        ctypes.c_void_p,  # extra
-    ]
-
-    # --- cnrtLoadLibrary ---
-    lib.cnrtLoadLibrary.restype = ctypes.c_int
-    lib.cnrtLoadLibrary.argtypes = [ctypes.c_char_p]
-
-    # --- cnrtGetSymbolAddress ---
-    lib.cnrtGetSymbolAddress.restype = ctypes.c_int
-    lib.cnrtGetSymbolAddress.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p]
-
-    _CNRT_EXT_LIB = lib
-    return lib
 
 
 def _resolve_cncc_path() -> str | None:
@@ -117,29 +53,50 @@ def _resolve_cncc_path() -> str | None:
 
 
 class MluRuntime:
-    """JIT compile BangC source, load the module, dispatch on MLU.
+    """JIT compile BangC source, load module, dispatch on MLU.
 
     Satisfies :class:`compgen.targets.gpu.contracts.GpuRuntime`.
+
+    Real CNRT flow::
+
+        cnrtSetDevice(0) → cnrtQueueCreate → CNCC compile .so
+        → ctypes.CDLL(.so) → call kernel function directly.
+
+    There is NO ``cnrtInvokeKernel`` / ``cnrtLoadLibrary`` in CNRT.
+    BangC ``<<<dim, func_type, queue>>>`` is lowered by CNCC into
+    host-side code in the output .so.
     """
 
     def __init__(self) -> None:
         self._queue: Any = None
+        self._cnrt_lib: Any = None
         self._initialized: bool = False
 
     def _ensure_init(self) -> None:
         if self._initialized:
             return
-        lib = _load_cnrt_ext()
+        lib = _load_cnrt()
         if lib is None:
             raise RuntimeError("CNRT not available — cannot dispatch on MLU")
-        ret = lib.cnrtInit(0)
+
+        # cnrtSetDevice(0)
+        if not _bind_cnrt_func(lib, "cnrtSetDevice", ctypes.c_int, [ctypes.c_int]):
+            raise RuntimeError("cnrtSetDevice not found in libcnrt.so")
+        ret = lib.cnrtSetDevice(0)
         if ret != 0:
-            raise RuntimeError(f"cnrtInit failed with code {ret}")
-        queue = ctypes.c_void_p()
-        ret = lib.cnrtCreateQueue(ctypes.byref(queue))
+            raise RuntimeError(f"cnrtSetDevice(0) failed with code {ret}")
+
+        # cnrtQueueCreate
+        if not _bind_cnrt_func(lib, "cnrtQueueCreate", ctypes.c_int,
+                               [ctypes.POINTER(ctypes.c_void_p)]):
+            raise RuntimeError("cnrtQueueCreate not found in libcnrt.so")
+        q = ctypes.c_void_p()
+        ret = lib.cnrtQueueCreate(ctypes.byref(q))
         if ret != 0:
-            raise RuntimeError(f"cnrtCreateQueue failed with code {ret}")
-        self._queue = queue
+            raise RuntimeError(f"cnrtQueueCreate failed with code {ret}")
+
+        self._queue = q
+        self._cnrt_lib = lib
         self._initialized = True
 
     def compile_source(
@@ -151,69 +108,36 @@ class MluRuntime:
         extra_options: tuple[str, ...] = (),
         extra_include_paths: tuple[str, ...] = (),
     ) -> Any:
-        """JIT compile BangC source via CNCC.
-
-        Writes ``cuda_source`` to a temp file, invokes CNCC to
-        produce a shared library, and returns a handle to the
-        loaded module.
-
-        CNCC invocation::
-
-            cncc --bangc -O2 -fPIC -shared <source>.mlu -o <output>.so
-
-        Returns a ctypes handle to the dlopen'd library.
-        """
+        """JIT compile BangC source via CNCC → ctypes.CDLL."""
         cncc_path = _resolve_cncc_path()
         if cncc_path is None:
-            raise RuntimeError(
-                "CNCC compiler not found. Set $CNCC_PATH or $NEUWARE_HOME."
-            )
+            raise RuntimeError("CNCC compiler not found. Set $CNCC_PATH or $NEUWARE_HOME.")
 
         with tempfile.TemporaryDirectory() as tmpdir:
             src_path = Path(tmpdir) / "kernel.mlu"
             so_path = Path(tmpdir) / "kernel.so"
-
             src_path.write_text(cuda_source)
 
-            cmd = [
-                cncc_path,
-                "--bangc",
-                "-O2",
-                "-fPIC",
-                "-shared",
-                str(src_path),
-                "-o",
-                str(so_path),
-            ]
+            cmd = [cncc_path, "--bangc", "-O2", "-fPIC", "-shared",
+                   str(src_path), "-o", str(so_path)]
             for opt in extra_options:
                 cmd.append(opt)
             for inc in extra_include_paths:
                 cmd.extend(["-I", inc])
 
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-            )
+            result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
                 raise RuntimeError(
                     f"CNCC compile failed (exit {result.returncode}):\n"
-                    f"STDERR:\n{result.stderr}\n"
-                    f"STDOUT:\n{result.stdout}"
+                    f"STDERR:\n{result.stderr}\nSTDOUT:\n{result.stdout}"
                 )
 
-            # Load the compiled .so via CNRT
-            lib = _load_cnrt_ext()
-            if lib is None:
-                raise RuntimeError("CNRT not available")
+            try:
+                lib = ctypes.CDLL(str(so_path))
+            except OSError as exc:
+                raise RuntimeError(f"Failed to load compiled .so: {exc}") from exc
 
-            so_bytes = str(so_path).encode("utf-8")
-            ret = lib.cnrtLoadLibrary(so_bytes)
-            if ret != 0:
-                raise RuntimeError(f"cnrtLoadLibrary failed with code {ret}")
-
-            # Return the .so path — caller uses it with get_symbol
-            return str(so_path)
+            return lib
 
     def launch(
         self,
@@ -226,42 +150,21 @@ class MluRuntime:
         kernel_params: Any = None,
         cooperative: bool = False,
     ) -> None:
-        """Launch a compiled BangC kernel on MLU.
+        """Call the kernel function directly from the loaded .so.
 
-        MLU's launch model differs from CUDA's:
-        - ``grid_dim`` maps to the number of tasks across cores.
-        - ``block_dim`` maps to tasks per core.
-        - ``cluster_dim`` is ignored (MLU370 doesn't support cluster launch).
-
-        The kernel function is resolved via ``cnrtGetSymbolAddress``
-        from the loaded module.
+        ``kernel_params`` is (kernel_name, *c_args).
         """
         self._ensure_init()
-        lib = _load_cnrt_ext()
-        if lib is None:
-            raise RuntimeError("CNRT not available")
+        del grid_dim, block_dim, cluster_dim, shared_mem_bytes, cooperative
 
-        # Resolve the kernel symbol
-        kernel_ptr = ctypes.c_void_p()
-        so_bytes = module_handle.encode("utf-8") if isinstance(module_handle, str) else module_handle
-        ret = lib.cnrtGetSymbolAddress(ctypes.byref(kernel_ptr), so_bytes)
-        if ret != 0:
-            raise RuntimeError(f"cnrtGetSymbolAddress failed with code {ret}")
+        if not isinstance(kernel_params, tuple) or len(kernel_params) < 1:
+            raise ValueError("kernel_params must be (kernel_name, *args)")
 
-        # MLU uses a 3D grid for multi-core dispatch
-        dim_x = ctypes.c_uint(grid_dim[0])
-        dim_y = ctypes.c_uint(grid_dim[1])
-        dim_z = ctypes.c_uint(grid_dim[2])
-
-        ret = lib.cnrtInvokeKernel(
-            kernel_ptr,
-            dim_x, dim_y, dim_z,
-            self._queue,
-            kernel_params,
-            None,
-        )
-        if ret != 0:
-            raise RuntimeError(f"cnrtInvokeKernel failed with code {ret}")
+        kernel_name, *args = kernel_params
+        kernel_func = getattr(module_handle, kernel_name, None)
+        if kernel_func is None:
+            raise RuntimeError(f"Kernel '{kernel_name}' not found in compiled module")
+        kernel_func(*args)
 
     def dispatch(
         self,
@@ -269,21 +172,14 @@ class MluRuntime:
         library_handle: Any,
         kernel_params: Any,
     ) -> None:
-        """CPU-style dispatch — delegates to launch for MLU."""
-        self.launch(
-            module_handle=library_handle,
-            grid_dim=(1, 1, 1),
-            block_dim=(1, 1, 1),
-            kernel_params=kernel_params,
-        )
+        """CPU-style dispatch — delegates to launch."""
+        self.launch(module_handle=library_handle, kernel_params=kernel_params)
 
     def synchronize(self) -> None:
-        """Block until all queued MLU work completes."""
-        if not self._initialized or self._queue is None:
+        """Block via ``cnrtQueueSync``."""
+        if not self._initialized:
             return
-
-        lib = _load_cnrt_ext()
-        if lib is None:
-            return
-
-        lib.cnrtSyncQueue(self._queue)
+        lib = self._cnrt_lib
+        if lib is not None and _bind_cnrt_func(lib, "cnrtQueueSync", ctypes.c_int,
+                                                [ctypes.c_void_p]):
+            lib.cnrtQueueSync(self._queue)

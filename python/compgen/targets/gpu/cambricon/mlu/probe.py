@@ -61,6 +61,24 @@ def _resolve_cnrt_lib_path() -> str | None:
     return None
 
 
+def _bind_cnrt_func(lib: ctypes.CDLL, name: str, restype: Any, argtypes: list[Any]) -> bool:
+    """Try to bind a CNRT function by name. Returns True on success.
+
+    Cambricon's CNRT API naming can vary across Neuware versions:
+    - ``cnInit`` vs ``cnrtInit``
+    - ``cnGetDeviceCount`` vs ``cnrtGetDeviceCount``
+    etc. This helper tries the exact name; callers should try
+    multiple candidate names.
+    """
+    try:
+        func = getattr(lib, name)
+    except AttributeError:
+        return False
+    func.restype = restype
+    func.argtypes = argtypes
+    return True
+
+
 def _load_cnrt() -> Any | None:
     """Load + cache the CNRT ctypes wrapper. Returns None if CNRT
     isn't reachable."""
@@ -77,37 +95,35 @@ def _load_cnrt() -> Any | None:
     except OSError:
         return None
 
-    # --- cnrtInit ---
-    lib.cnrtInit.restype = ctypes.c_int
-    lib.cnrtInit.argtypes = [ctypes.c_int]
-
-    # --- cnrtGetDeviceCount ---
-    lib.cnrtGetDeviceCount.restype = ctypes.c_int
-    lib.cnrtGetDeviceCount.argtypes = [ctypes.POINTER(ctypes.c_uint)]
-
-    # --- cnrtGetDeviceInfo (minimal) ---
-    # We mostly need device count + lib version for probing.
-    lib.cnrtGetLibVersion.restype = ctypes.c_int
-    lib.cnrtGetLibVersion.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
-
     _CNRT_LIB = lib
     return lib
 
 
+# ---------------------------------------------------------------------------
+# Probing — real CNRT API: cnrtSetDevice + cnrtGetDeviceCount
+# ---------------------------------------------------------------------------
+
 def _cnrt_probe_success() -> bool:
-    """Initialize CNRT and check for >=1 devices."""
+    """Initialize CNRT with ``cnrtSetDevice(0)`` and check device count."""
     lib = _load_cnrt()
     if lib is None:
         return False
-    try:
-        ret = lib.cnrtInit(0)
-        if ret != 0:
-            return False
+
+    # cnrtSetDevice(int device_id) → int (0 = success)
+    if not _bind_cnrt_func(lib, "cnrtSetDevice", ctypes.c_int, [ctypes.c_int]):
+        return False
+    ret = lib.cnrtSetDevice(0)
+    if ret != 0:
+        return False
+
+    # cnrtGetDeviceCount(uint* count) → int
+    if _bind_cnrt_func(lib, "cnrtGetDeviceCount", ctypes.c_int, [ctypes.POINTER(ctypes.c_uint)]):
         count = ctypes.c_uint(0)
         ret = lib.cnrtGetDeviceCount(ctypes.byref(count))
         return ret == 0 and count.value > 0
-    except OSError:
-        return False
+
+    # Fallback: cnrtSetDevice succeeded → assume >= 1 device
+    return True
 
 
 # ---------------------------------------------------------------------------
