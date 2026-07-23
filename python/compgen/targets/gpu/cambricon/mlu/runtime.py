@@ -135,7 +135,6 @@ class MluRuntime:
         ret = lib.cnrtInit(0)
         if ret != 0:
             raise RuntimeError(f"cnrtInit failed with code {ret}")
-
         queue = ctypes.c_void_p()
         ret = lib.cnrtCreateQueue(ctypes.byref(queue))
         if ret != 0:
