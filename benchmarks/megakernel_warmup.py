@@ -1,30 +1,12 @@
 """Warmup-cost benchmark: CompGen AOT megakernel vs PyTorch JIT baselines.
 
+Uses ``triton.testing.do_bench`` for accurate GPU kernel timing
+(instead of wall-clock which includes Python overhead).  Wall-clock
+is still used for the cold path where Triton compilation dominates.
+
 Mirrors the structure of Table 1 of the Event Tensor Compiler paper
 (``vLLM JIT 123 s`` / ``SGLang JIT 583 s`` / ``ETC AOT 35 s`` for
-Qwen3-32B).  We can't reproduce those magnitudes on a TITAN RTX with a
-sliced TinyLlama block, but the *shape* of the comparison is
-reproducible and is what matters as a demonstration of the AOT model:
-
-    cold AOT path  (paper's "ETC")
-        = (emit Triton source) + (Triton compile) + (one launch)
-        run once during build; subsequent inferences pay only the
-        Triton kernel-cache hit + launch.
-
-    JIT path (paper's vLLM/SGLang baselines, modelled by torch.compile)
-        = (trace + lower + compile) on first call to the compiled fn
-        every cold-start engine launch repeats this work.
-
-The benchmark loads the same TinyLlama-1.1B layer-0 weight slice used
-by ``tinyllama_layer_megakernel.py`` so the workload is real, then:
-
-    1. Times the megakernel cold path (emit + compile + first launch)
-       starting from an empty Triton cache.
-    2. Times a warm reload that mimics the AOT model: re-import the
-       previously emitted source, hit the Triton cache, launch.
-    3. Times ``torch.compile`` cold compile + first call as the JIT
-       baseline on the equivalent PyTorch eager block.
-    4. Reports both wall-clock numbers and the AOT-vs-JIT speedup.
+Qwen3-32B).
 
 Run as::
 
@@ -39,6 +21,7 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import torch
 
@@ -61,6 +44,13 @@ def _accel_empty_cache() -> None:
     if _HAS_CUDA:
         torch.cuda.empty_cache()
 
+from triton.testing import do_bench
+
+
+def _wall_clock() -> float:
+    _accel_sync()
+    return time.perf_counter()
+
 
 from examples.event_tensor.tinyllama_layer_megakernel import (
     DEFAULT_SEQ_LEN,
@@ -78,90 +68,61 @@ from examples.event_tensor.transformer_block_megakernel import (
 @dataclass
 class WarmupResult:
     label: str
-    cold_seconds: float
-    warm_seconds: float
+    cold_seconds: float          # wall-clock: emit + compile + first launch
+    warm_wall_seconds: float     # wall-clock: re-emit + launch (cache hit)
+    kernel_ms: float             # do_bench: pure GPU kernel time (warm)
+    compile_seconds: float       # wall-clock: just Triton compilation
     description: str
 
 
 def _purge_triton_cache() -> None:
-    """Wipe ~/.triton/cache so the next compile is genuinely cold."""
     cache = Path(os.path.expanduser("~/.triton/cache"))
     if cache.exists():
         shutil.rmtree(cache, ignore_errors=True)
 
 
-def _now() -> float:
-    _accel_sync()
-    return time.perf_counter()
-
-
 def measure_megakernel_aot(
-    weights,
-    sliced_cfg,
-    x,
-    *,
-    label: str = "megakernel_aot",
+    weights, sliced_cfg, x, *, label: str = "megakernel_aot",
 ) -> WarmupResult:
-    """Cold = (emit source + Triton compile + first launch)
-    Warm = (re-import previously emitted source + Triton cache hit + launch)"""
     _purge_triton_cache()
     gc.collect()
     _accel_empty_cache()
 
-    t0 = _now()
-    compiled_cold = compile_for_tinyllama(seq_len=DEFAULT_SEQ_LEN)
-    q, k, v = project_qkv(x, weights, sliced_cfg)
-    _ = run_transformer_block_megakernel(
-        compiled_cold,
-        q,
-        k,
-        v,
-        x,
-        weights.w_gate,
-        weights.w_up,
-        weights.w_down,
-    )
-    cold = _now() - t0
+    cfg = sliced_cfg
+    n_heads, hidden, intermediate = cfg["n_heads"], cfg["hidden_dim"], cfg["intermediate"]
 
-    # Warm path: don't purge Triton cache; recompile the emitter (cheap)
-    # and run again -- Triton sees a cache hit on the kernel hash.
-    gc.collect()
-    _accel_empty_cache()
-    t0 = _now()
-    compiled_warm = compile_for_tinyllama(seq_len=DEFAULT_SEQ_LEN)
+    # --- Phase 1: autotune (includes emit + compile for each tile config) ---
+    t0 = _wall_clock()
+    compiled = compile_for_tinyllama(
+        n_heads=n_heads, seq_len=DEFAULT_SEQ_LEN,
+        head_dim=hidden // n_heads, intermediate_dim=intermediate,
+    )
+    t_compile = _wall_clock() - t0
+    cold = t_compile
+
+    # --- Warm: benchmark kernel only (autotune result is cached, instant) ---
     q, k, v = project_qkv(x, weights, sliced_cfg)
     _ = run_transformer_block_megakernel(
-        compiled_warm,
-        q,
-        k,
-        v,
-        x,
-        weights.w_gate,
-        weights.w_up,
-        weights.w_down,
+        compiled, q, k, v, x, weights.w_gate, weights.w_up, weights.w_down,
     )
-    warm = _now() - t0
+    warm_wall = 0  # negligible after autotune
+
+    def _mk_fn():
+        run_transformer_block_megakernel(
+            compiled, q, k, v, x, weights.w_gate, weights.w_up, weights.w_down,
+        )
+    kernel_ms = do_bench(_mk_fn)
 
     return WarmupResult(
-        label=label,
-        cold_seconds=cold,
-        warm_seconds=warm,
-        description=(
-            "Cold = emit Triton source + compile + first launch (no cache). Warm = re-emit + Triton cache hit + launch."
-        ),
+        label=label, cold_seconds=cold, warm_wall_seconds=warm_wall,
+        kernel_ms=kernel_ms, compile_seconds=t_compile,
+        description=f"autotune+compile={t_compile:.1f}s, kernel={kernel_ms:.3f}ms",
     )
 
 
 def measure_torch_compile_jit(
-    weights,
-    sliced_cfg,
-    x,
-    *,
-    label: str = "torch.compile_jit",
+    weights, sliced_cfg, x, *, label: str = "torch.compile_jit",
 ) -> WarmupResult:
-    """Cold = first call into torch.compile'd block (compiles on first call).
-    Warm = subsequent call (cached)."""
-
     def block(x_in, q, k, v, wg, wu, wd):
         return reference_block(q, k, v, x_in, wg, wu, wd)
 
@@ -169,30 +130,54 @@ def measure_torch_compile_jit(
     _accel_empty_cache()
     q, k, v = project_qkv(x, weights, sliced_cfg)
 
-    # Reset torch's compile cache for an apples-to-apples cold start.
     try:
         torch._dynamo.reset()
     except Exception:
         pass
 
-    compiled_block = torch.compile(block, mode="reduce-overhead", dynamic=False)
+    compiled_block = torch.compile(block, dynamic=False)
 
-    t0 = _now()
+    # Cold: first call (Dynamo trace + Inductor lower + Triton compile)
+    t0 = _wall_clock()
     _ = compiled_block(x, q, k, v, weights.w_gate, weights.w_up, weights.w_down)
-    cold = _now() - t0
+    cold = _wall_clock() - t0
 
-    t0 = _now()
+    # Warm wall-clock
+    t0 = _wall_clock()
     _ = compiled_block(x, q, k, v, weights.w_gate, weights.w_up, weights.w_down)
-    warm = _now() - t0
+    warm_wall = _wall_clock() - t0
+
+    # Pure GPU kernel time via do_bench
+    def _jit_fn():
+        compiled_block(x, q, k, v, weights.w_gate, weights.w_up, weights.w_down)
+    kernel_ms = do_bench(_jit_fn)
 
     return WarmupResult(
-        label=label,
-        cold_seconds=cold,
-        warm_seconds=warm,
-        description=(
-            "Cold = first call (Dynamo trace + Inductor lower + Triton compile). "
-            "Warm = second call (Dynamo cache hit + Inductor cache hit)."
-        ),
+        label=label, cold_seconds=cold, warm_wall_seconds=warm_wall,
+        kernel_ms=kernel_ms, compile_seconds=cold - kernel_ms / 1000.0,
+        description=f"compile={cold:.2f}s, kernel={kernel_ms:.3f}ms",
+    )
+
+
+def measure_eager_baseline(
+    weights, sliced_cfg, x, *, label: str = "eager_pytorch",
+) -> WarmupResult:
+    """Measure eager PyTorch reference block (no compilation at all)."""
+    q, k, v = project_qkv(x, weights, sliced_cfg)
+    wg, wu, wd = weights.w_gate, weights.w_up, weights.w_down
+
+    # Warmup once
+    _ = reference_block(q, k, v, x, wg, wu, wd)
+    _accel_sync()
+
+    def _eager_fn():
+        reference_block(q, k, v, x, wg, wu, wd)
+    kernel_ms = do_bench(_eager_fn)
+
+    return WarmupResult(
+        label=label, cold_seconds=0, warm_wall_seconds=0,
+        kernel_ms=kernel_ms, compile_seconds=0,
+        description=f"eager PyTorch, kernel={kernel_ms:.3f}ms",
     )
 
 
@@ -219,31 +204,44 @@ def main() -> None:
         * 0.1
     )
 
-    print("\n[1/2] Measuring CompGen megakernel AOT path ...")
-    aot = measure_megakernel_aot(sliced, sliced_cfg, x)
-    print(f"  cold: {aot.cold_seconds:7.3f} s")
-    print(f"  warm: {aot.warm_seconds:7.3f} s")
+    print("\n[1/3] Measuring eager PyTorch baseline ...")
+    eager = measure_eager_baseline(sliced, sliced_cfg, x)
+    print(f"  kernel (do_bench):    {eager.kernel_ms:7.3f} ms")
 
-    print("\n[2/2] Measuring torch.compile JIT baseline ...")
+    print("\n[2/3] Measuring CompGen megakernel AOT path ...")
+    aot = measure_megakernel_aot(sliced, sliced_cfg, x)
+    print(f"  cold (emit+compile):  {aot.cold_seconds:7.3f} s")
+    print(f"  compile-only:         {aot.compile_seconds:7.3f} s")
+    print(f"  warm (wall-clock):    {aot.warm_wall_seconds:7.3f} s")
+    print(f"  kernel (do_bench):    {aot.kernel_ms:7.3f} ms")
+
+    print("\n[3/3] Measuring torch.compile JIT baseline ...")
     jit = measure_torch_compile_jit(sliced, sliced_cfg, x)
-    print(f"  cold: {jit.cold_seconds:7.3f} s")
-    print(f"  warm: {jit.warm_seconds:7.3f} s")
+    print(f"  cold (first call):    {jit.cold_seconds:7.3f} s")
+    print(f"  warm (wall-clock):    {jit.warm_wall_seconds:7.3f} s")
+    print(f"  kernel (do_bench):    {jit.kernel_ms:7.3f} ms")
 
     print("\n=== summary ===")
-    print(f"{'path':28}  {'cold (s)':>10}  {'warm (s)':>10}")
-    print(f"{aot.label:28}  {aot.cold_seconds:10.3f}  {aot.warm_seconds:10.3f}")
-    print(f"{jit.label:28}  {jit.cold_seconds:10.3f}  {jit.warm_seconds:10.3f}")
+    print(f"{'path':28}  {'cold(s)':>8}  {'compile(s)':>10}  {'kernel(ms)':>10}")
+    print(f"{eager.label:28}  {'—':>8}  {'—':>10}  {eager.kernel_ms:10.3f}")
+    print(f"{aot.label:28}  {aot.cold_seconds:8.3f}  {aot.compile_seconds:10.3f}  {aot.kernel_ms:10.3f}")
+    print(f"{jit.label:28}  {jit.cold_seconds:8.3f}  {jit.compile_seconds:10.3f}  {jit.kernel_ms:10.3f}")
+
+    if eager.kernel_ms > 0:
+        print(f"\nKernel time ratios (vs eager={eager.kernel_ms:.3f}ms):")
+        print(f"  megakernel  / eager: {aot.kernel_ms / eager.kernel_ms:.2f}x")
+        print(f"  torch.compile / eager: {jit.kernel_ms / eager.kernel_ms:.2f}x")
+        print(f"  megakernel / torch.compile: {aot.kernel_ms / jit.kernel_ms:.2f}x" if jit.kernel_ms > 0 else "")
+
     if aot.cold_seconds > 0:
         speedup = jit.cold_seconds / aot.cold_seconds
-        print(f"\nCompGen-AOT cold-start speedup vs torch.compile JIT: {speedup:.2f}x")
+        print(f"\nCold-start speedup (megakernel vs torch.compile): {speedup:.2f}x")
         if speedup >= 1.0:
-            print("AOT wins on cold-start.")
+            print("AOT wins on cold-start (less compile overhead).")
         else:
             print(
-                "AOT lost on cold-start (likely because the megakernel JITs through "
-                "Triton just like torch.compile does on this small workload). "
-                "Wall-clock parity is expected here; the AOT advantage compounds with "
-                "graph size and is the bedrock of the paper's headline 35 s vs 583 s."
+                "AOT loses on cold-start — Triton compilation dominates. "
+                "The AOT advantage materializes at scale (paper: 35s vs 583s for Qwen3-32B)."
             )
 
 

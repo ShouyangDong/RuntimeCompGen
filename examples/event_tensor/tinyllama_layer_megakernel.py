@@ -49,7 +49,7 @@ from examples.event_tensor.transformer_block_megakernel import (
 
 def _find_tinyllama_snapshot() -> Path:
     cache = Path(os.path.expanduser(
-        "~/.cache/huggingface/hub/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0"
+        "~/.cache/modelscope/models/AI-ModelScope--TinyLlama-1.1B-Chat-v1.0"
     ))
     if not cache.exists():
         raise SystemExit(

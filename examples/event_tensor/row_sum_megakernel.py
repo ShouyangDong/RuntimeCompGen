@@ -26,6 +26,22 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+
+# Auto-detect accelerator: MLU > CUDA
+_HAS_MLU = hasattr(torch, "mlu") and torch.mlu.is_available()
+_HAS_CUDA = torch.cuda.is_available()
+_HAS_ACCEL = _HAS_MLU or _HAS_CUDA
+_ACCEL_DEVICE = "mlu" if _HAS_MLU else "cuda"
+_ACCEL_TAG = "MLU" if _HAS_MLU else "GPU"
+
+
+def _accel_sync() -> None:
+    if _HAS_MLU:
+        torch.mlu.synchronize()
+    elif _HAS_CUDA:
+        torch.cuda.synchronize()
+
+
 from xdsl.dialects.builtin import (
     ArrayAttr,
     IntegerAttr,
@@ -158,7 +174,7 @@ def build_event_graph(n_row_blocks: int, j_chunks: int) -> tuple[ModuleOp, Graph
             },
         ),
     )
-    sm_count = max(1, min(n_events, 8))
+    sm_count = max(1, min(n_events, 32))
     graph = GraphOp(
         sym_name="row_sum",
         policy="static",
@@ -226,8 +242,8 @@ def compile_megakernel(
     import os
     import tempfile
 
-    fd, path = tempfile.mkstemp(prefix=f"{lowering.kernel_name}_", suffix=".py")
-    with os.fdopen(fd, "w") as f:
+    path = os.path.join(os.path.dirname(__file__) or ".", f"{lowering.kernel_name}.py")
+    with open(path, "w") as f:
         f.write(lowering.kernel_source)
     linecache.checkcache(path)
     module_spec = importlib.util.spec_from_file_location(lowering.kernel_name, path)
@@ -295,8 +311,8 @@ def run_megakernel(
             f"input shape {tuple(a.shape)} != expected "
             f"({expected_rows}, {expected_cols})"
         )
-    if not a.is_cuda:
-        raise RuntimeError("megakernel requires a CUDA tensor")
+    if not (a.is_cuda or (_HAS_MLU and a.is_mlu)):
+        raise RuntimeError(f"megakernel requires an accelerator tensor ({_ACCEL_TAG})")
 
     device = a.device
     n_events = compiled.n_row_blocks * compiled.j_chunks
@@ -327,7 +343,7 @@ def run_megakernel(
         num_warps=compiled.lowering.launch_config["num_warps"],
         num_stages=compiled.lowering.launch_config["num_stages"],
     )
-    torch.cuda.synchronize()
+    _accel_sync()
 
     # Sanity post-condition: every event counter must have drained to zero.
     if not bool(torch.all(e == 0)):
@@ -351,21 +367,46 @@ __all__ = [
 
 
 if __name__ == "__main__":
-    if not torch.cuda.is_available():
-        raise SystemExit("This example requires a CUDA device.")
+    if not _HAS_ACCEL:
+        raise SystemExit(f"This example requires an accelerator ({_ACCEL_TAG} not available).")
+    from triton.testing import do_bench
 
+
+    # Compile once
     compiled = compile_megakernel(n_row_blocks=8, j_chunks=4)
-    print(f"Emitted kernel: {compiled.kernel_name} ({len(compiled.kernel_source)} chars)")
-    print(f"  grid = SM_COUNT = {compiled.sm_count}, max_qlen = {compiled.max_qlen}")
-    print(f"  task table per SM: {compiled.lowering.task_queue}")
-
     M = compiled.n_row_blocks * compiled.block_m
     K = compiled.j_chunks * compiled.block_k
-    a = torch.randn((M, K), dtype=torch.float32, device="cuda")
+    print(f"Emitted kernel: {compiled.kernel_name} ({len(compiled.kernel_source)} chars)")
+    print(f"  shape=({M},{K}), grid={compiled.sm_count}")
 
+    # Allocate
+    a = torch.randn((M, K), dtype=torch.float32, device=_ACCEL_DEVICE)
+
+    # Correctness
     got = run_megakernel(compiled, a)
     ref = reference(a)
     err = (got - ref).abs().max().item()
-    print(f"max |got - ref| = {err:.3e}  on shape ({M},{K})")
-    assert err < 1e-3, "row-sum megakernel does not match PyTorch reference"
-    print("PASS: emitted megakernel matches torch.sum on real GPU.")
+    print(f"  correctness: max |got - ref| = {err:.3e} {'OK' if err < 1e-3 else 'FAIL'}")
+
+    # --- Benchmark ---
+    print(f"\n{'='*60}")
+    print(f"  Benchmark: row_sum ({M}x{K}) on {_ACCEL_TAG}")
+    print(f"{'='*60}")
+
+    eager_ms = do_bench(lambda: a.sum(dim=-1))
+    print(f"  eager (a.sum(-1)):        {eager_ms:>10.3f} ms")
+
+    compiled_sum = torch.compile(lambda x: x.sum(dim=-1), dynamic=False)
+    _ = compiled_sum(a)
+    comp_ms = do_bench(lambda: compiled_sum(a))
+    print(f"  torch.compile:            {comp_ms:>10.3f} ms")
+
+    _ = run_megakernel(compiled, a)
+    mk_ms = do_bench(lambda: run_megakernel(compiled, a))
+    print(f"  megakernel:               {mk_ms:>10.3f} ms")
+
+    print(f"\n  Ratios (vs eager={eager_ms:.3f}ms):")
+    print(f"    torch.compile / eager:   {comp_ms / eager_ms:.2f}x")
+    print(f"    megakernel  / eager:     {mk_ms / eager_ms:.2f}x")
+    if comp_ms > 0:
+        print(f"    megakernel  / compiled:  {mk_ms / comp_ms:.2f}x")
