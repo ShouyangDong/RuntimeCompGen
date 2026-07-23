@@ -51,11 +51,26 @@ from __future__ import annotations
 import importlib.util
 import linecache
 import os
-import tempfile
 from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+
+# Auto-detect accelerator: MLU > CUDA
+_HAS_MLU = hasattr(torch, "mlu") and torch.mlu.is_available()
+_HAS_CUDA = torch.cuda.is_available()
+_HAS_ACCEL = _HAS_MLU or _HAS_CUDA
+_ACCEL_DEVICE = "mlu" if _HAS_MLU else "cuda"
+_ACCEL_TAG = "MLU" if _HAS_MLU else "GPU"
+
+
+def _accel_sync() -> None:
+    if _HAS_MLU:
+        torch.mlu.synchronize()
+    elif _HAS_CUDA:
+        torch.cuda.synchronize()
+
+
 from xdsl.dialects.builtin import (
     ArrayAttr,
     IntegerAttr,
@@ -396,8 +411,8 @@ def compile_transformer_block_megakernel(
     )
     lowering = lower_megakernel_dynamic(graph, spec=spec)
 
-    fd, path = tempfile.mkstemp(prefix=f"{lowering.kernel_name}_", suffix=".py")
-    with os.fdopen(fd, "w") as f:
+    path = os.path.join(os.path.dirname(__file__) or ".", f"{lowering.kernel_name}.py")
+    with open(path, "w") as f:
         f.write(lowering.kernel_source)
     linecache.checkcache(path)
     module_spec = importlib.util.spec_from_file_location(lowering.kernel_name, path)
@@ -524,7 +539,7 @@ def run_transformer_block_megakernel(
         num_warps=compiled.lowering.launch_config["num_warps"],
         num_stages=compiled.lowering.launch_config["num_stages"],
     )
-    torch.cuda.synchronize()
+    _accel_sync()
     return y
 
 
@@ -559,8 +574,8 @@ __all__ = [
 
 
 if __name__ == "__main__":
-    if not torch.cuda.is_available():
-        raise SystemExit("This example requires a CUDA device.")
+    if not _HAS_ACCEL:
+        raise SystemExit(f"This example requires an accelerator ({_ACCEL_TAG} not available).")
 
     H, S, D_HEAD, I = 4, 32, 32, 128
     D_HIDDEN = H * D_HEAD
@@ -573,13 +588,13 @@ if __name__ == "__main__":
     print(f"  device functions: {sorted(compiled.lowering.device_function_table.values())}")
 
     torch.manual_seed(31)
-    q       = torch.randn((H, S, D_HEAD),  dtype=torch.float32, device="cuda")
-    k       = torch.randn((H, S, D_HEAD),  dtype=torch.float32, device="cuda")
-    v       = torch.randn((H, S, D_HEAD),  dtype=torch.float32, device="cuda")
-    x       = torch.randn((S, D_HIDDEN),   dtype=torch.float32, device="cuda")
-    w_gate  = torch.randn((I, D_HIDDEN),   dtype=torch.float32, device="cuda") * 0.05
-    w_up    = torch.randn((I, D_HIDDEN),   dtype=torch.float32, device="cuda") * 0.05
-    w_down  = torch.randn((D_HIDDEN, I),   dtype=torch.float32, device="cuda") * 0.05
+    q       = torch.randn((H, S, D_HEAD),  dtype=torch.float32, device=_ACCEL_DEVICE)
+    k       = torch.randn((H, S, D_HEAD),  dtype=torch.float32, device=_ACCEL_DEVICE)
+    v       = torch.randn((H, S, D_HEAD),  dtype=torch.float32, device=_ACCEL_DEVICE)
+    x       = torch.randn((S, D_HIDDEN),   dtype=torch.float32, device=_ACCEL_DEVICE)
+    w_gate  = torch.randn((I, D_HIDDEN),   dtype=torch.float32, device=_ACCEL_DEVICE) * 0.05
+    w_up    = torch.randn((I, D_HIDDEN),   dtype=torch.float32, device=_ACCEL_DEVICE) * 0.05
+    w_down  = torch.randn((D_HIDDEN, I),   dtype=torch.float32, device=_ACCEL_DEVICE) * 0.05
 
     got = run_transformer_block_megakernel(compiled, q, k, v, x, w_gate, w_up, w_down)
     ref = reference_block(q, k, v, x, w_gate, w_up, w_down)

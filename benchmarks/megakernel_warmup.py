@@ -42,6 +42,26 @@ from pathlib import Path
 
 import torch
 
+# Auto-detect accelerator: MLU > CUDA
+_HAS_MLU = hasattr(torch, "mlu") and torch.mlu.is_available()
+_HAS_CUDA = torch.cuda.is_available()
+_HAS_ACCEL = _HAS_MLU or _HAS_CUDA
+_ACCEL_DEVICE = "mlu" if _HAS_MLU else "cuda"
+_ACCEL_TAG = "MLU" if _HAS_MLU else "GPU"
+
+
+def _accel_sync() -> None:
+    if _HAS_MLU:
+        torch.mlu.synchronize()
+    elif _HAS_CUDA:
+        torch.cuda.synchronize()
+
+
+def _accel_empty_cache() -> None:
+    if _HAS_CUDA:
+        torch.cuda.empty_cache()
+
+
 from examples.event_tensor.tinyllama_layer_megakernel import (
     DEFAULT_SEQ_LEN,
     compile_for_tinyllama,
@@ -71,7 +91,7 @@ def _purge_triton_cache() -> None:
 
 
 def _now() -> float:
-    torch.cuda.synchronize()
+    _accel_sync()
     return time.perf_counter()
 
 
@@ -86,7 +106,7 @@ def measure_megakernel_aot(
     Warm = (re-import previously emitted source + Triton cache hit + launch)"""
     _purge_triton_cache()
     gc.collect()
-    torch.cuda.empty_cache()
+    _accel_empty_cache()
 
     t0 = _now()
     compiled_cold = compile_for_tinyllama(seq_len=DEFAULT_SEQ_LEN)
@@ -106,7 +126,7 @@ def measure_megakernel_aot(
     # Warm path: don't purge Triton cache; recompile the emitter (cheap)
     # and run again -- Triton sees a cache hit on the kernel hash.
     gc.collect()
-    torch.cuda.empty_cache()
+    _accel_empty_cache()
     t0 = _now()
     compiled_warm = compile_for_tinyllama(seq_len=DEFAULT_SEQ_LEN)
     q, k, v = project_qkv(x, weights, sliced_cfg)
@@ -146,7 +166,7 @@ def measure_torch_compile_jit(
         return reference_block(q, k, v, x_in, wg, wu, wd)
 
     gc.collect()
-    torch.cuda.empty_cache()
+    _accel_empty_cache()
     q, k, v = project_qkv(x, weights, sliced_cfg)
 
     # Reset torch's compile cache for an apples-to-apples cold start.
@@ -177,11 +197,11 @@ def measure_torch_compile_jit(
 
 
 def main() -> None:
-    if not torch.cuda.is_available():
-        raise SystemExit("This benchmark requires a CUDA device.")
+    if not _HAS_ACCEL:
+        raise SystemExit(f"This benchmark requires an accelerator ({_ACCEL_TAG} not available).")
 
-    print("Loading TinyLlama-1.1B layer-0 weights ...")
-    full = load_tinyllama_layer0()
+    print(f"Loading TinyLlama-1.1B layer-0 weights ... (device={_ACCEL_DEVICE})")
+    full = load_tinyllama_layer0(_ACCEL_DEVICE)
     sliced, sliced_cfg = slice_weights_for_megakernel(full)
     print(
         f"  workload: H={sliced_cfg['n_heads']}, "
@@ -194,7 +214,7 @@ def main() -> None:
         torch.randn(
             (DEFAULT_SEQ_LEN, sliced_cfg["hidden_dim"]),
             dtype=torch.float32,
-            device="cuda",
+            device=_ACCEL_DEVICE,
         )
         * 0.1
     )

@@ -33,6 +33,13 @@ from pathlib import Path
 import torch
 from safetensors.torch import load_file
 
+# Auto-detect accelerator: MLU > CUDA
+_HAS_MLU = hasattr(torch, "mlu") and torch.mlu.is_available()
+_HAS_CUDA = torch.cuda.is_available()
+_HAS_ACCEL = _HAS_MLU or _HAS_CUDA
+_ACCEL_DEVICE = "mlu" if _HAS_MLU else "cuda"
+_ACCEL_TAG = "MLU" if _HAS_MLU else "GPU"
+
 from examples.event_tensor.llama_decoder_layer_megakernel import (
     CompiledLlamaDecoderLayer,
     compile_llama_decoder_layer,
@@ -43,7 +50,7 @@ from examples.event_tensor.llama_decoder_layer_megakernel import (
 
 def _find_tinyllama_snapshot() -> Path:
     cache = Path(os.path.expanduser(
-        "~/.cache/huggingface/hub/models--TinyLlama--TinyLlama-1.1B-Chat-v1.0"
+        "~/.cache/modelscope/models/AI-ModelScope--TinyLlama-1.1B-Chat-v1.0"
     ))
     if not cache.exists():
         raise SystemExit(
@@ -69,10 +76,11 @@ class TinyLlamaFullLayer0Weights:
     cfg: dict
 
 
-def load_tinyllama_full_layer0(device: str = "cuda") -> TinyLlamaFullLayer0Weights:
+def load_tinyllama_full_layer0(device: str | None = None) -> TinyLlamaFullLayer0Weights:
+    dev = device or _ACCEL_DEVICE
     snap = _find_tinyllama_snapshot()
     cfg = json.loads((snap / "config.json").read_text())
-    weights = load_file(str(snap / "model.safetensors"), device=device)
+    weights = load_file(str(snap / "model.safetensors"), device=dev)
     p = "model.layers.0"
     return TinyLlamaFullLayer0Weights(
         w_norm1 = weights[f"{p}.input_layernorm.weight"].to(torch.float32),
@@ -209,8 +217,8 @@ __all__ = [
 
 
 if __name__ == "__main__":
-    if not torch.cuda.is_available():
-        raise SystemExit("This example requires a CUDA device.")
+    if not _HAS_ACCEL:
+        raise SystemExit(f"This example requires an accelerator ({_ACCEL_TAG} not available).")
 
     print("Loading TinyLlama layer-0 weights (full set, including norms) ...")
     full = load_tinyllama_full_layer0()
@@ -238,7 +246,7 @@ if __name__ == "__main__":
 
     torch.manual_seed(2026)
     x = torch.randn(
-        (S, sliced_cfg["hidden_dim"]), dtype=torch.float32, device="cuda",
+        (S, sliced_cfg["hidden_dim"]), dtype=torch.float32, device=_ACCEL_DEVICE,
     ) * 0.1
 
     print("\nRunning megakernel + reference ...")
