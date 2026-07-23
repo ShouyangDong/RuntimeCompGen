@@ -27,6 +27,8 @@ Wave 1.10/1.11/1.12 — unified target hierarchy:
         blackwell/ arch leaf — sm_100/sm_120, cuBLASDx, cluster-launch
         hopper/    arch leaf — sm_90, wgmma
         ampere/    arch leaf — sm_80/86, older mma atoms
+      cambricon/ __init__.py registers vendor-common entry
+        mlu/     arch leaf — mlu370/mlu590, BangC kernel backend
       amd/      (placeholder)
       intel/    (placeholder)
     cpu/        contracts.py
@@ -63,6 +65,8 @@ def _register_in_tree() -> None:
         "compgen.targets.gpu.nvidia.blackwell",
         "compgen.targets.gpu.nvidia.hopper",
         "compgen.targets.gpu.nvidia.ampere",
+        "compgen.targets.gpu.cambricon",
+        "compgen.targets.gpu.cambricon.mlu",
         "compgen.targets.cpu.x86",
     )
     for mod_path in in_tree_modules:
