@@ -213,6 +213,8 @@ def compile_megakernel(
     j_chunks: int = 4,
     block_m: int = 32,
     block_k: int = 32,
+    num_warps: int = 4,
+    num_stages: int = 3,
 ) -> CompiledMegakernel:
     """End-to-end: IR -> static schedule -> Triton source -> @triton.jit.
 
@@ -229,6 +231,8 @@ def compile_megakernel(
             DeviceFunctionSpec(name="partial_sum", body_source=_PARTIAL_SUM_BODY),
             DeviceFunctionSpec(name="final_sum", body_source=_FINAL_SUM_BODY),
         ),
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     lowering = lower_megakernel(graph, spec=spec)
     if not lowering.kernel_source:

@@ -93,7 +93,7 @@ class MegakernelLoweringSpec:
     constexpr_args: tuple[str, ...] = ()
     device_functions: tuple[DeviceFunctionSpec, ...] = ()
     num_warps: int = 4
-    num_stages: int = 2
+    num_stages: int = 3
     tune_config: dict[str, tuple[int, ...]] = field(default_factory=dict)
     """Autotuning sweep axes.  Keys in :attr:`constexpr_args` become
     ``tl.constexpr`` sweeps; ``"num_warps"`` / ``"num_stages"`` become

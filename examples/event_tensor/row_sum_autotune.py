@@ -5,13 +5,14 @@ hard-coded ``BLOCK_M=32, BLOCK_K=32, num_warps=4, num_stages=2``, this
 example lets Triton search for the best combination automatically via
 :attr:`MegakernelLoweringSpec.tune_config`.
 
-The autotune sweep covers two Triton launch-param axes:
+The autotune sweep covers two Triton launch-param axes
+(tuned to MLU's valid range; CUDA supports wider):
 
     ============== ==============================
     Axis            Values
     ============== ==============================
-    num_warps       2, 4, 8
-    num_stages      1, 2, 3, 4
+    num_warps       1, 4
+    num_stages      1, 3, 5
     ============== ==============================
 
 Tile sizes (BLOCK_M, BLOCK_K) are NOT tuned because they determine the
@@ -165,8 +166,8 @@ def compile_megakernel_autotune(
         # (N_ROW_BLOCKS = M // BLOCK_M, event-tensor shape) depends on
         # them and is fixed at lowering time.
         tune_config={
-            "num_warps":   (2, 4, 8),
-            "num_stages":  (1, 2, 3, 4),
+            "num_warps":   (1, 4),
+            "num_stages":  (1, 3, 5),
         },
     )
     lowering = lower_megakernel(graph, spec=spec)
@@ -203,6 +204,147 @@ def compile_megakernel_autotune(
 
 
 # ---------------------------------------------------------------------------
+# Outer search: sweep BLOCK_M, BLOCK_K (re-build IR per tile size)
+# ---------------------------------------------------------------------------
+
+
+def search_row_sum_megakernel(
+    M: int = 256,
+    K: int = 128,
+    *,
+    block_m_values: tuple[int, ...] = (16, 32, 64, 128),
+    block_k_values: tuple[int, ...] = (16, 32, 64, 128),
+    num_warps_values: tuple[int, ...] = (1, 4),
+    num_stages_values: tuple[int, ...] = (1, 3, 5),
+    max_total_tasks: int = 64,
+    verbose: bool = True,
+) -> dict:
+    """Outer-loop search over tile sizes + launch params.
+
+    Unlike :func:`compile_megakernel_autotune` which only sweeps launch
+    params via ``@triton.autotune`` (IR graph is fixed), this function
+    re-builds the IR graph, event tensors, and task schedule for every
+    (BLOCK_M, BLOCK_K) combination so tile sizes can be tuned.
+
+    Args:
+        max_total_tasks: Skip configs whose total task count
+            (partial_sum + final_sum tasks = n_row_blocks * j_chunks + n_row_blocks)
+            exceeds this threshold.  Too many tiny tasks → event-coordination
+            overhead dominates → kernel timeout on some accelerators.
+
+    Returns a dict with the best config and its timing.
+    """
+    from examples.event_tensor.row_sum_megakernel import (
+        compile_megakernel,
+        run_megakernel,
+    )
+    from triton.testing import do_bench
+
+    _accel_sync()
+    if hasattr(torch, "mlu") and hasattr(torch.mlu, "empty_cache"):
+        torch.mlu.empty_cache()
+
+    a = torch.randn((M, K), dtype=torch.float32, device=_ACCEL_DEVICE)
+
+    best_time = float("inf")
+    best_config: dict = {}
+    total = 0
+    tried = 0
+    skipped = 0
+
+    for block_m in block_m_values:
+        if M % block_m != 0:
+            continue
+        n_row_blocks = M // block_m
+        for block_k in block_k_values:
+            if K % block_k != 0:
+                continue
+            j_chunks = K // block_k
+            n_tasks = n_row_blocks * j_chunks + n_row_blocks
+            if n_tasks > max_total_tasks:
+                skipped += len(num_warps_values) * len(num_stages_values)
+                continue
+            total += len(num_warps_values) * len(num_stages_values)
+
+    if verbose:
+        print(f"  Searching {total} configs over {_ACCEL_TAG}...")
+        if skipped:
+            print(f"    ({skipped} skipped: > {max_total_tasks} total tasks)")
+        print(f"    M={M}, K={K}")
+        print(f"    BLOCK_M x BLOCK_K: {block_m_values} x {block_k_values}")
+        print(f"    num_warps x num_stages: {num_warps_values} x {num_stages_values}")
+        print()
+
+    for block_m in block_m_values:
+        if M % block_m != 0:
+            continue
+        n_row_blocks = M // block_m
+        for block_k in block_k_values:
+            if K % block_k != 0:
+                continue
+            j_chunks = K // block_k
+            n_tasks = n_row_blocks * j_chunks + n_row_blocks
+            if n_tasks > max_total_tasks:
+                continue
+            for nw in num_warps_values:
+                for ns in num_stages_values:
+                    tried += 1
+                    label = f"[{tried}/{total}]"
+                    compiled = compile_megakernel(
+                        n_row_blocks=n_row_blocks,
+                        j_chunks=j_chunks,
+                        block_m=block_m,
+                        block_k=block_k,
+                        num_warps=nw,
+                        num_stages=ns,
+                    )
+                    try:
+                        _ = run_megakernel(compiled, a)
+                        _accel_sync()
+                        t = do_bench(lambda: run_megakernel(compiled, a))
+                    except RuntimeError as exc:
+                        # Flush any pending async MLU error so it doesn't
+                        # leak to the next kernel launch.
+                        try:
+                            _accel_sync()
+                        except RuntimeError:
+                            pass
+                        if verbose:
+                            print(f"    {label} BLOCK_M={block_m:>4} BLOCK_K={block_k:>4}  "
+                                  f"warps={nw} stages={ns}  → SKIP ({exc})")
+                        continue
+
+                    if verbose:
+                        marker = " *" if t < best_time else ""
+                        print(f"    {label} BLOCK_M={block_m:>4} BLOCK_K={block_k:>4}  "
+                              f"warps={nw} stages={ns}  → {t:.4f} ms{marker}")
+
+                    if t < best_time:
+                        best_time = t
+                        best_config = {
+                            "BLOCK_M": block_m,
+                            "BLOCK_K": block_k,
+                            "num_warps": nw,
+                            "num_stages": ns,
+                            "time_ms": t,
+                            "compiled": compiled,
+                        }
+
+    if verbose:
+        print()
+        if not best_config:
+            raise RuntimeError(
+                f"No config passed.  Try increasing max_total_tasks (currently {max_total_tasks}) "
+                f"or using different block sizes."
+            )
+        print(f"  Best: BLOCK_M={best_config['BLOCK_M']}, BLOCK_K={best_config['BLOCK_K']}, "
+              f"num_warps={best_config['num_warps']}, num_stages={best_config['num_stages']} "
+              f"→ {best_config['time_ms']:.4f} ms")
+
+    return best_config
+
+
+# ---------------------------------------------------------------------------
 # Standalone benchmark
 # ---------------------------------------------------------------------------
 
@@ -222,8 +364,8 @@ if __name__ == "__main__":
     print("=" * 60)
     print("  Autotuned row-sum megakernel")
     print("=" * 60)
-    print(f"  tune_config: num_warps={2,4,8}, num_stages={1,2,3,4}")
-    print(f"  (3×4 = 12 configs; Triton benchmarks on first launch)")
+    print(f"  tune_config: num_warps={1,4}, num_stages={1,3,5}")
+    print(f"  (2×3 = 6 configs; Triton benchmarks on first launch)")
     print()
 
     compiled_auto = compile_megakernel_autotune(
@@ -256,6 +398,16 @@ if __name__ == "__main__":
     print(f"  autotuned megakernel:  {auto_ms:.3f} ms")
     print()
 
+    # ── Outer search (sweep BLOCK_M, BLOCK_K + launch params) ──
+    print("-" * 60)
+    print("  Outer search (re-builds IR per tile config)")
+    print("-" * 60)
+
+    result = search_row_sum_megakernel(M=M, K=K, verbose=True)
+    compiled_search = result["compiled"]
+    search_ms = result["time_ms"]
+    print()
+
     # ── Default (hardcoded) for comparison ──
     print("-" * 60)
     print("  Default (hardcoded) megakernel for comparison")
@@ -263,18 +415,31 @@ if __name__ == "__main__":
 
     from examples.event_tensor.row_sum_megakernel import compile_megakernel, run_megakernel
 
+    # Reset device state: the search phase ran many kernel launches and may
+    # have left the MLU driver in a fragile state.
+    _accel_sync()
+    if hasattr(torch, "mlu") and hasattr(torch.mlu, "empty_cache"):
+        torch.mlu.empty_cache()
+    a = torch.randn((M, K), dtype=torch.float32, device=_ACCEL_DEVICE)
+    _accel_sync()
+
     compiled_default = compile_megakernel(
         n_row_blocks=N_ROW_BLOCKS, j_chunks=J_CHUNKS,
         block_m=BLOCK_M, block_k=BLOCK_K,
     )
     print(f"  Decorator: @triton.jit")
     print(f"  BLOCK_M={BLOCK_M}, BLOCK_K={BLOCK_K}")
-    print(f"  num_warps=4, num_stages=2")
+    print(f"  num_warps=4, num_stages=3")
     print()
 
-    _ = run_megakernel(compiled_default, a)
-    default_ms = do_bench(lambda: run_megakernel(compiled_default, a))
-    print(f"  default megakernel:    {default_ms:.3f} ms")
+    try:
+        _ = run_megakernel(compiled_default, a)
+        _accel_sync()
+        default_ms = do_bench(lambda: run_megakernel(compiled_default, a))
+        print(f"  default megakernel:    {default_ms:.3f} ms")
+    except RuntimeError as exc:
+        print(f"  default megakernel:    FAILED ({exc})")
+        default_ms = float("nan")
     print()
 
     # ── Baselines ──
@@ -300,6 +465,9 @@ if __name__ == "__main__":
     print(f"  {'torch.compile':>30s} {comp_ms:>10.3f}  {comp_ms/eager_ms:>9.2f}x")
     print(f"  {'megakernel (default)':>30s} {default_ms:>10.3f}  {default_ms/eager_ms:>9.2f}x")
     print(f"  {'megakernel (autotuned)':>30s} {auto_ms:>10.3f}  {auto_ms/eager_ms:>9.2f}x")
+    print(f"  {'megakernel (search)':>30s} {search_ms:>10.3f}  {search_ms/eager_ms:>9.2f}x")
     if default_ms > 0:
         speedup = default_ms / auto_ms
-        print(f"\n  Autotune vs default speedup: {speedup:.2f}x")
+        print(f"\n  Autotune vs default speedup:    {speedup:.2f}x")
+        speedup2 = default_ms / search_ms
+        print(f"  Outer-search vs default speedup: {speedup2:.2f}x")
