@@ -5,7 +5,8 @@ Sibling of :mod:`compgen.ir.tile.lower_triton` and
 already been annotated by
 :mod:`compgen.ir.payload.passes.megakernel_static_schedule` (Algorithm 1 of
 the Event Tensor Compiler paper) and produces a single ``@triton.jit``
-function whose grid equals the target's SM count.
+(or ``@triton.autotune`` when :attr:`MegakernelLoweringSpec.tune_config` is
+non-empty) function whose grid equals the target's SM count.
 
 Code-generation strategy:
 
@@ -33,6 +34,7 @@ supply bodies for every device function referenced by the graph.
 
 from __future__ import annotations
 
+import itertools
 import json
 import textwrap
 from collections.abc import Sequence
@@ -92,6 +94,16 @@ class MegakernelLoweringSpec:
     device_functions: tuple[DeviceFunctionSpec, ...] = ()
     num_warps: int = 4
     num_stages: int = 2
+    tune_config: dict[str, tuple[int, ...]] = field(default_factory=dict)
+    """Autotuning sweep axes.  Keys in :attr:`constexpr_args` become
+    ``tl.constexpr`` sweeps; ``"num_warps"`` / ``"num_stages"`` become
+    Triton launch-param sweeps.  Empty dict (default) → plain
+    ``@triton.jit``, no autotuning overhead.
+
+    Example::
+
+        tune_config={"BLOCK_M": (16, 32, 64), "num_warps": (2, 4, 8)}
+    """
 
 
 @dataclass(frozen=True)
@@ -236,6 +248,37 @@ def _emit_dispatch_branches(
     return "\n".join(branches)
 
 
+def _build_autotune_configs(spec: MegakernelLoweringSpec) -> str:
+    """Build the source code for a ``triton.Config`` list from ``spec.tune_config``.
+
+    Returns source for::
+
+        [
+            triton.Config({'BLOCK_M': 16, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+            ...
+        ]
+    """
+    keys = list(spec.tune_config.keys())
+    value_lists = [spec.tune_config[k] for k in keys]
+    config_lines: list[str] = []
+    for combo in itertools.product(*value_lists):
+        kwargs: dict[str, int] = {}
+        nw = spec.num_warps
+        ns = spec.num_stages
+        for k, v in zip(keys, combo):
+            if k == "num_warps":
+                nw = v
+            elif k == "num_stages":
+                ns = v
+            else:
+                kwargs[k] = v
+        kwargs_parts = ", ".join(f"{k!r}: {v}" for k, v in kwargs.items())
+        config_lines.append(
+            f"        triton.Config({{{kwargs_parts}}}, num_warps={nw}, num_stages={ns}),"
+        )
+    return "[\n" + "\n".join(config_lines) + "\n    ]"
+
+
 def lower_megakernel(
     graph: GraphOp,
     spec: MegakernelLoweringSpec | None = None,
@@ -327,6 +370,16 @@ def lower_megakernel(
     mk_decl_parts.append("MAX_QLEN: tl.constexpr")
 
     lines.append("# --- persistent megakernel: grid = SM_COUNT ---")
+    if spec.tune_config:
+        configs_src = _build_autotune_configs(spec)
+        key_args = [k for k in spec.tune_config if k not in ("num_warps", "num_stages")]
+        if not key_args:
+            key_args = ["SM_COUNT"]  # fallback: always present in megakernel signature
+        lines.append("@triton.autotune(")
+        lines.append(f"    configs={configs_src},")
+        lines.append(f"    key=[{', '.join(repr(k) for k in key_args)}],")
+        lines.append("    warmup=25, rep=100,")
+        lines.append(")")
     lines.append("@triton.jit")
     lines.append(f"def {kernel_name}(")
     for part in mk_decl_parts:
