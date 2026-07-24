@@ -9,7 +9,9 @@ from compgen.ir.payload.passes.megakernel_static_schedule import (
     StaticMegakernelSchedule,
 )
 from compgen.ir.tile.lower_megakernel import (
+    DeviceFunctionSpec,
     MegakernelLoweringResult,
+    MegakernelLoweringSpec,
     lower_megakernel,
 )
 from xdsl.dialects.builtin import (
@@ -150,4 +152,104 @@ def test_lowering_kernel_source_is_syntactically_valid_python() -> None:
     mod, graph = _build_gemm_rs()
     StaticMegakernelSchedule().run(mod)
     src = lower_megakernel(graph).kernel_source
+    ast.parse(src)
+
+
+# ---------------------------------------------------------------------------
+# Autotuning (tune_config)
+# ---------------------------------------------------------------------------
+
+
+def test_tune_config_empty_emits_plain_jit() -> None:
+    """When tune_config is empty (default), emit @triton.jit."""
+    mod, graph = _build_gemm_rs()
+    StaticMegakernelSchedule().run(mod)
+    spec = MegakernelLoweringSpec(tune_config={})
+    src = lower_megakernel(graph, spec=spec).kernel_source
+    assert "@triton.jit" in src
+    assert "@triton.autotune" not in src
+
+
+def test_tune_config_non_empty_emits_autotune() -> None:
+    """When tune_config has entries, emit @triton.autotune wrapping @triton.jit."""
+    mod, graph = _build_gemm_rs()
+    StaticMegakernelSchedule().run(mod)
+    spec = MegakernelLoweringSpec(
+        tune_config={"num_warps": (2, 4), "num_stages": (1, 2)},
+    )
+    src = lower_megakernel(graph, spec=spec).kernel_source
+    # Both decorators present, autotune wraps jit
+    autotune_pos = src.index("@triton.autotune")
+    jit_pos = src.index("@triton.jit", autotune_pos)
+    assert autotune_pos < jit_pos, "@triton.autotune must wrap @triton.jit"
+    # Device functions (_run_*, _event_*) still use @triton.jit
+    assert "@triton.jit" in src[:autotune_pos]  # device funcs before megakernel
+
+
+def test_tune_config_launch_params_only() -> None:
+    """Only num_warps/num_stages axes → key falls back to SM_COUNT."""
+    mod, graph = _build_gemm_rs()
+    StaticMegakernelSchedule().run(mod)
+    spec = MegakernelLoweringSpec(
+        tune_config={"num_warps": (2, 4), "num_stages": (1, 2, 3)},
+    )
+    src = lower_megakernel(graph, spec=spec).kernel_source
+    assert "@triton.autotune" in src
+    # key is required by Triton; SM_COUNT is the fallback
+    assert "key=['SM_COUNT']" in src
+
+
+def test_tune_config_constexpr_axes_add_key() -> None:
+    """Constexpr axes in tune_config → emit key=[...]."""
+    mod, graph = _build_gemm_rs()
+    StaticMegakernelSchedule().run(mod)
+    spec = MegakernelLoweringSpec(
+        constexpr_args=("BLOCK_M", "BLOCK_K"),
+        tune_config={"BLOCK_M": (16, 32), "BLOCK_K": (32, 64)},
+    )
+    src = lower_megakernel(graph, spec=spec).kernel_source
+    assert "@triton.autotune" in src
+    assert "key=['BLOCK_M', 'BLOCK_K']" in src
+
+
+def test_tune_config_cartesian_product_in_configs() -> None:
+    """Configs list should contain the cartesian product of all axis values."""
+    spec = MegakernelLoweringSpec(
+        constexpr_args=("BLOCK_M",),
+        tune_config={"BLOCK_M": (16, 32), "num_warps": (2, 4)},
+    )
+    from compgen.ir.tile.lower_megakernel import _build_autotune_configs
+
+    src = _build_autotune_configs(spec)
+    # 2 × 2 = 4 configs
+    assert src.count("triton.Config(") == 4
+    # Default num_warps fallback for unmatched keys
+    assert "num_warps=2" in src
+    assert "num_warps=4" in src
+
+
+def test_tune_config_missing_axes_use_defaults() -> None:
+    """num_stages not in tune_config → uses spec.num_stages default in every config."""
+    spec = MegakernelLoweringSpec(
+        num_stages=3,
+        tune_config={"num_warps": (2, 4, 8)},
+    )
+    from compgen.ir.tile.lower_megakernel import _build_autotune_configs
+
+    src = _build_autotune_configs(spec)
+    # All 3 configs should have num_stages=3 (the default)
+    assert src.count("num_stages=3") == 3
+
+
+def test_tune_config_source_is_valid_python() -> None:
+    """The full emitted source with @triton.autotune must parse as valid Python."""
+    import ast
+
+    mod, graph = _build_gemm_rs()
+    StaticMegakernelSchedule().run(mod)
+    spec = MegakernelLoweringSpec(
+        constexpr_args=("BLOCK_M", "BLOCK_K"),
+        tune_config={"BLOCK_M": (16, 32), "BLOCK_K": (32, 64), "num_warps": (2, 4)},
+    )
+    src = lower_megakernel(graph, spec=spec).kernel_source
     ast.parse(src)
