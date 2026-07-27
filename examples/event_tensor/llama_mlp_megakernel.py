@@ -267,10 +267,10 @@ class CompiledMLPMegakernel:
 
 
 def compile_mlp_megakernel(
-    M: int = 32,           # batch * seq tokens
-    K: int = 64,           # hidden dim (Llama-2-7B: 4096; we use 64 for fast test)
-    I: int = 128,          # intermediate dim (Llama-2-7B: 11008; we use 128)
-    N: int = 64,           # output dim (== K in real Llama; we keep separate for shape clarity)
+    M: int = 32,
+    K: int = 64,
+    I: int = 128,
+    N: int = 64,
     BLOCK_M: int = 16,
     BLOCK_I: int = 32,
     BLOCK_N: int = 16,

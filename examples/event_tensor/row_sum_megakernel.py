@@ -93,8 +93,9 @@ partial = tl.sum(a, axis=1)
 b_offsets = j * (N_ROW_BLOCKS * BLOCK_M) + i * BLOCK_M + tl.arange(0, BLOCK_M)
 tl.store(B_ptr + b_offsets, partial)
 
-# event.notify -- decrement counter at E[i * J + j]
-tl.atomic_add(E_ptr + (i * J + j), -1)
+# event.notify -- skip atomic if consumer is on the same SM
+sm_id = tl.program_id(0)
+_event_notify(E_ptr, i * J + j, sm_id)
 """
 
 
@@ -109,11 +110,10 @@ tl.atomic_add(E_ptr + (i * J + j), -1)
 _FINAL_SUM_BODY = """
 i = task_id
 
-# event.wait on E[i, j] for every k-chunk j
+# event.wait on E[i, j] for every k-chunk j -- skipped if same SM
+sm_id = tl.program_id(0)
 for j in tl.static_range(0, J):
-    counter = tl.atomic_or(E_ptr + (i * J + j), 0)
-    while counter > 0:
-        counter = tl.atomic_or(E_ptr + (i * J + j), 0)
+    _event_wait(E_ptr, i * J + j, sm_id)
 
 row_offsets = i * BLOCK_M + tl.arange(0, BLOCK_M)
 acc = tl.zeros((BLOCK_M,), dtype=tl.float32)

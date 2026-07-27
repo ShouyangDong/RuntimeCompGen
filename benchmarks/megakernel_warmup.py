@@ -95,7 +95,7 @@ def measure_megakernel_aot(
     t0 = _wall_clock()
     compiled = compile_for_tinyllama(
         n_heads=n_heads, seq_len=DEFAULT_SEQ_LEN,
-        head_dim=hidden // n_heads, intermediate_dim=intermediate,
+        intermediate=intermediate,
     )
     t_compile = _wall_clock() - t0
     cold = t_compile

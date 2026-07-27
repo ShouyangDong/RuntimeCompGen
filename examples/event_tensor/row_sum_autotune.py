@@ -212,7 +212,7 @@ def search_row_sum_megakernel(
     M: int = 256,
     K: int = 128,
     *,
-    block_m_values: tuple[int, ...] = (16, 32, 64, 128),
+    block_m_values: tuple[int, ...] = (16, 32, 64, 128, 256),
     block_k_values: tuple[int, ...] = (16, 32, 64, 128),
     num_warps_values: tuple[int, ...] = (1, 4),
     num_stages_values: tuple[int, ...] = (1, 3, 5),

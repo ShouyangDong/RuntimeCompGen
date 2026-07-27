@@ -121,6 +121,9 @@ def test_lowering_emits_atomic_notify_and_wait_helpers() -> None:
     assert "tl.atomic_add" in src
     assert "_event_wait" in src
     assert "tl.atomic_or" in src
+    # New locality-aware helpers emit EVENT_IS_LOCAL table
+    assert "EVENT_IS_LOCAL" in src
+    assert "N_EVENTS" in src
 
 
 def test_lowering_emits_per_device_function_stubs() -> None:

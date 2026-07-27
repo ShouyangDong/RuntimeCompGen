@@ -44,7 +44,7 @@ from typing import Any
 from xdsl.dialects.builtin import IntegerAttr, StringAttr
 
 from compgen.ir.event.attrs import EventTensorTypeAttr
-from compgen.ir.event.ops import EventTensorOp, GraphOp
+from compgen.ir.event.ops import CallDeviceOp, EventTensorOp, GraphOp
 
 _SCHEDULE_ATTR = "compgen.static_schedule"
 
@@ -186,7 +186,7 @@ def _emit_task_table(
             sm_entries.append((tid, kind))
             encoded_entries.append(f'("{tid}", {kind})')
         structured[sm_idx] = sm_entries
-        lines.append(f"    [{', '.join(encoded_entries) or '# empty'}],   # SM {sm_idx}")
+        lines.append(f"    [{', '.join(encoded_entries)}],   # SM {sm_idx}")
     lines.append("]")
     return "\n".join(lines), structured
 
@@ -279,6 +279,148 @@ def _build_autotune_configs(spec: MegakernelLoweringSpec) -> str:
     return "[\n" + "\n".join(config_lines) + "\n    ]"
 
 
+def _regroup_per_sm_order(
+    graph: GraphOp,
+    per_sm_order: dict[str, list[str]],
+    sm_count: int,
+) -> dict[str, list[str]]:
+    """Post-process schedule: move tasks so every producer & its consumer
+    share a SM, making all events local.
+
+    Uses the IR's ``CallDeviceOp`` out_edges / in_edges to determine
+    producer-consumer relationships.  For the row-sum pattern this means
+    all ``partial_sum`` tasks for a row-block land on the same SM as
+    that row's ``final_sum``.
+    """
+    # Extract producer/consumer event indices from IR
+    # Map: event_idx → set of (task_id_prefix, task_i)
+    ev_producers: dict[int, list[tuple[str, int]]] = {}
+    ev_consumers: dict[int, list[tuple[str, int]]] = {}
+    for op in graph.body.ops:
+        if not isinstance(op, CallDeviceOp):
+            continue
+        func = op.device_func.root_reference.data
+        if op.out_edges is not None:
+            for edge in op.out_edges:
+                for c in edge.indices.data:  # type: ignore[union-attr]
+                    ev_idx = int(c.data)
+                    ev_producers.setdefault(ev_idx, []).append((func, ev_idx))
+        if op.in_edges is not None:
+            task_count = int(op.task_shape.data[0].value.data)  # type: ignore[union-attr]
+            n_events = sum(1 for _ in op.in_edges)
+            events_per_task = n_events // task_count if task_count else 1
+            for edge in op.in_edges:
+                for c in edge.indices.data:  # type: ignore[union-attr]
+                    ev_idx = int(c.data)
+                    consumer_i = ev_idx // events_per_task if events_per_task else 0
+                    ev_consumers.setdefault(ev_idx, []).append((func, consumer_i))
+
+    # Build task_id → sm_id lookup from original schedule
+    task_to_sm: dict[str, int] = {}
+    for sm_str, tasks in per_sm_order.items():
+        for tid in tasks:
+            task_to_sm[tid] = int(sm_str)
+
+    if not ev_producers or not ev_consumers:
+        return per_sm_order
+
+    # For each event, if producer and consumer are on different SMs,
+    # move the producer to the consumer's SM.
+    new_per_sm: dict[int, list[str]] = {s: list(tasks) for s_str, tasks in per_sm_order.items() if (s := int(s_str)) >= 0}
+    # Flatten for rebuilding
+    for ev_idx, producers in ev_producers.items():
+        consumers = ev_consumers.get(ev_idx, [])
+        for p_func, p_i in producers:
+            p_tid = f"{p_func}:{p_i}"
+            for c_func, c_i in consumers:
+                c_tid = f"{c_func}:{c_i}"
+                if p_tid not in task_to_sm or c_tid not in task_to_sm:
+                    continue
+                p_sm = task_to_sm[p_tid]
+                c_sm = task_to_sm[c_tid]
+                if p_sm != c_sm:
+                    # Move producer to consumer's SM — insert BEFORE consumer
+                    # so the producer executes first (dependency order).
+                    for sm, tasks in list(new_per_sm.items()):
+                        if p_tid in tasks:
+                            tasks.remove(p_tid)
+                    c_queue = new_per_sm.setdefault(c_sm, [])
+                    try:
+                        c_pos = c_queue.index(c_tid)
+                        c_queue.insert(c_pos, p_tid)
+                    except ValueError:
+                        c_queue.append(p_tid)
+                    task_to_sm[p_tid] = c_sm  # update mapping
+
+    # Convert back to str-keyed dict
+    result: dict[str, list[str]] = {str(s): tasks for s, tasks in new_per_sm.items()}
+    for s in range(sm_count):
+        result.setdefault(str(s), [])
+    return result
+
+
+def _build_event_locality(
+    graph: GraphOp,
+    per_sm_order: dict[str, list[str]],
+) -> tuple[int, str, str]:
+    """Analyse which events are local (producer & consumer on same SM).
+
+    Returns ``(n_events, is_local_tuple_src, n_events_src)``.
+    """
+    task_to_sm: dict[str, int] = {}
+    for sm_str, tasks in per_sm_order.items():
+        sm = int(sm_str)
+        for tid in tasks:
+            task_to_sm[tid] = sm
+
+    n_events = 0
+    for op in graph.body.ops:
+        if isinstance(op, EventTensorOp):
+            et: EventTensorTypeAttr = op.event_type
+            shape = [int(d.value.data) for d in et.shape.data if isinstance(d, IntegerAttr)]
+            n_events = 1
+            for d in shape:
+                n_events *= max(d, 1)
+            break
+
+    if n_events == 0:
+        return 0, "()", "0"
+
+    producers: dict[str, int] = {}   # task_id → ev_idx
+    consumers: dict[str, list[int]] = {}  # task_id → [ev_indices]
+
+    for op in graph.body.ops:
+        if not isinstance(op, CallDeviceOp):
+            continue
+        func = op.device_func.root_reference.data
+        task_count = int(op.task_shape.data[0].value.data)  # type: ignore[union-attr]
+
+        if op.out_edges is not None:
+            for edge in op.out_edges:
+                for c in edge.indices.data:  # type: ignore[union-attr]
+                    ev_idx = int(c.data)
+                    producers[f"{func}:{ev_idx}"] = ev_idx
+
+        if op.in_edges is not None:
+            events_per_task = n_events // task_count if task_count else n_events
+            for task_i in range(task_count):
+                start = task_i * events_per_task
+                consumers[f"{func}:{task_i}"] = list(range(start, start + events_per_task))
+
+    is_local_parts: list[str] = []
+    for ev_idx in range(n_events):
+        sms: set[int] = set()
+        for tid, idx in producers.items():
+            if idx == ev_idx and tid in task_to_sm:
+                sms.add(task_to_sm[tid])
+        for tid, ev_list in consumers.items():
+            if ev_idx in ev_list and tid in task_to_sm:
+                sms.add(task_to_sm[tid])
+        is_local_parts.append("True" if len(sms) <= 1 else "False")
+
+    return n_events, "(" + ", ".join(is_local_parts) + ",)", str(n_events)
+
+
 def lower_megakernel(
     graph: GraphOp,
     spec: MegakernelLoweringSpec | None = None,
@@ -314,6 +456,9 @@ def lower_megakernel(
     per_sm_order = {str(k): list(v) for k, v in schedule["per_sm_order"].items()}
     assignment = schedule["assignment"]
 
+    # ── Regroup: co-locate producer & consumer tasks on same SM ──
+    per_sm_order = _regroup_per_sm_order(graph, per_sm_order, sm_count)
+
     funcs = sorted({tid.split(":")[0] for tid in assignment})
     func_to_kind = {fn: i for i, fn in enumerate(funcs)}
     task_kind_map: dict[str, int] = {tid: func_to_kind[tid.split(":")[0]] for tid in assignment}
@@ -324,6 +469,10 @@ def lower_megakernel(
     dispatch_branches = _emit_dispatch_branches(funcs, func_to_kind, dispatch_call)
     kernel_name = _kernel_name(graph)
 
+    # Analyse event locality: if producer & consumer are on the same SM
+    # the event is "local" and atomics can be skipped.
+    n_events, is_local_src, n_events_src = _build_event_locality(graph, per_sm_order)
+
     lines: list[str] = []
     lines.append("import triton")
     lines.append("import triton.language as tl")
@@ -331,16 +480,27 @@ def lower_megakernel(
     lines.append("# Per-SM task table baked into the megakernel at compile time.")
     lines.append(task_table_src)
     lines.append("")
-    lines.append("# --- atomic notify / wait helpers (event-tensor protocol) ---")
+    lines.append("# --- event locality table ---")
+    lines.append(f"N_EVENTS = tl.constexpr({n_events_src})")
+    lines.append(f"EVENT_IS_LOCAL = tl.constexpr({is_local_src})")
+    lines.append("")
+    lines.append("# --- atomic notify / wait helpers (locality-aware) ---")
     lines.append("@triton.jit")
-    lines.append("def _event_notify(E_ptr, linear_idx, decrement: tl.constexpr):")
-    lines.append("    tl.atomic_add(E_ptr + linear_idx, -decrement)")
+    lines.append("def _event_notify(E_ptr, ev_idx, sm_id):")
+    lines.append("    for k in tl.static_range(0, N_EVENTS):")
+    lines.append("        if ev_idx == k:")
+    lines.append("            if EVENT_IS_LOCAL[k]:")
+    lines.append("                tl.store(E_ptr + k, 0)  # same SM, non-atomic")
+    lines.append("            else:")
+    lines.append("                tl.atomic_add(E_ptr + k, -1)  # cross-SM")
     lines.append("")
     lines.append("@triton.jit")
-    lines.append("def _event_wait(E_ptr, linear_idx):")
-    lines.append("    counter = tl.atomic_or(E_ptr + linear_idx, 0)")
-    lines.append("    while counter > 0:")
-    lines.append("        counter = tl.atomic_or(E_ptr + linear_idx, 0)")
+    lines.append("def _event_wait(E_ptr, ev_idx, sm_id):")
+    lines.append("    for k in tl.static_range(0, N_EVENTS):")
+    lines.append("        if ev_idx == k and not EVENT_IS_LOCAL[k]:")
+    lines.append("            counter = tl.atomic_or(E_ptr + k, 0)")
+    lines.append("            while counter > 0:")
+    lines.append("                counter = tl.atomic_or(E_ptr + k, 0)")
     lines.append("")
     lines.append("# --- per-device-function bodies ---")
     for fn in funcs:
