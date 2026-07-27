@@ -338,7 +338,6 @@ def run_attention_megakernel(
 
 def reference_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """PyTorch eager reference -- ``F.scaled_dot_product_attention``."""
-    # SDPA expects (B, H, S, D); we have (H, S, D), add a batch dim.
     return F.scaled_dot_product_attention(
         q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0),
         is_causal=False,
@@ -358,9 +357,6 @@ if __name__ == "__main__":
     if not torch.cuda.is_available():
         raise SystemExit("This example requires a CUDA device.")
 
-    # Llama-2-7B uses head_dim=128.  We use D=32 here so the test runs
-    # quickly on any GPU; the megakernel structure is identical at any
-    # head_dim that's a power of two.
     H, S, D = 4, 64, 32
     compiled = compile_attention_megakernel(n_heads=H, seq_len=S, head_dim=D, q_tile_size=16)
     print(f"Emitted attention megakernel: {compiled.kernel_name}")
